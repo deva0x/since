@@ -51,11 +51,12 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 SCHEMA_VERSION = 3
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -134,7 +135,14 @@ def human_duration(seconds: float) -> str:
 
 
 def tilde(p: str) -> str:
-    return p.replace(str(HOME), "~")
+    # Only collapse a LEADING $HOME — replacing every occurrence turns a path like
+    # /Users/me/data/Users/me/file into a nonsensical ~/data~/file.
+    h = str(HOME)
+    if p == h:
+        return "~"
+    if p.startswith(h + os.sep):
+        return "~" + p[len(h):]
+    return p
 
 
 # The tool's INPUT is potentially malware-controlled (plist filenames, process
@@ -144,11 +152,16 @@ def tilde(p: str) -> str:
 #     C0 controls + ESC before anything reaches the terminal.
 #  2. shell/AppleScript injection via the copy-paste `undo:` hints. Never build a
 #     runnable command by string-interpolating an untrusted name; shlex-quote it.
-# Strip ALL C0 controls INCLUDING \t \n \r — a newline in an attacker-chosen name
-# would otherwise inject extra output lines and forge e.g. a "signature: Apple-signed"
-# line or a fake "undo:" command. Also strip DEL/C1 and the Unicode format chars used
-# for output spoofing: bidi overrides (Trojan-Source), zero-width chars, and the BOM.
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff-\ufeff]")
+# Strip C0 controls that CAN forge output — \n \r (inject extra lines / a fake
+# "signature: Apple-signed" or "undo:" line), ESC, and DEL/C1 — plus the Unicode format
+# chars used for output spoofing: bidi overrides (Trojan-Source), zero-width chars, BOM,
+# line/paragraph separators (U+2028/U+2029), and lone UTF-16 surrogates (a non-UTF-8
+# Linux filename reaches us via surrogateescape and would otherwise raise
+# UnicodeEncodeError when printed, killing the whole report). TAB (\x09) is deliberately
+# KEPT: it cannot forge a line, and stripping it mangled tab-indented config diffs.
+_CTRL_RE = re.compile(
+    r"[\x00-\x08\x0a-\x1f\x7f-\x9f\ud800-\udfff"
+    r"\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
 
 def clean(s) -> str:
     """Neutralize terminal control/escape/format chars in any attacker-derived string."""
@@ -165,30 +178,87 @@ def q(s: str) -> str:
 # the token in that line where it can be shoulder-surfed or logged.
 _PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
 # key=value where the key NAME contains a sensitive word — covers underscore forms
-# (GITHUB_TOKEN, aws_secret_access_key, API_KEY). Value = REST of line (multi-token),
-# so "Authorization: Bearer <jwt>" doesn't leak the token past the first word.
+# (GITHUB_TOKEN, aws_secret_access_key, API_KEY, SSHPASS). Value = REST of line
+# (multi-token), so "Authorization: Bearer <jwt>" doesn't leak the token past the first
+# word. Both word-char runs are BOUNDED ({0,64}) — an unbounded `[\w.\-]*` on each side
+# is catastrophically quadratic, and a long base64-ish line in a tracked rc file could
+# stall the unattended `digest --notify` for minutes (attacker-plantable DoS).
 _KV_RE = re.compile(
-    r"(?i)([\w.\-]*(?:secret|passwd|password|token|api[_-]?key|access[_-]?key|"
-    r"client[_-]?secret|private[_-]?key|authoriz|_auth)[\w.\-]*)(\s*[:=]\s*|\s+)(\S.*)$")
-_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}")   # auth headers
+    r"(?i)([\w.\-]{0,64}(?:secret|pass(?:wd|word|phrase)?|token|api[_-]?key|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|authoriz|_auth|credential)[\w.\-]{0,64})"
+    r"(\s*[:=]\s*|\s+)(\S.*)$")
+_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})")  # auth headers
 _URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
+# curl .curlrc credentials: `user = "name:password"`, `-u name:password`,
+# `--proxy-user u:p`. The password is the part after the first colon in the user field —
+# NOT a `://…@` URL, so _URLAUTH_RE misses it. Keep the username for context, mask the pass.
+# NOTE the anchor allows a leading unified-diff marker (`+`/`-`): redact() runs on diff
+# lines, and a bare `(?:^|\s)` would let `+user = "u:pw"` slip through unredacted.
+_USERPASS_RE = re.compile(
+    r'(?i)((?:^|[\s+-])(?:-u|--user|--proxy-user|user|username)\s*=?\s*"?[^"\s:]+:)([^"\s]+)')
 _TOKEN_RE = re.compile(                                                     # standalone tokens
     r"\bAKIA[0-9A-Z]{16}\b|\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
     r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b|\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
 _B64LINE_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")                     # PEM body / raw key
+_KW_VALUES = {"yes", "no", "true", "false", "none", "null", "required",
+              "optional", "default", "auto", "inherit", "prohibit-password"}
+# Keys whose VALUE is the credential itself (an assignment `password=…`, `_authToken:…`).
+# Distinct from a directive NAME that merely contains "authoriz"/"_auth"
+# (`AuthorizedKeysFile`, `AuthorizedKeysCommandUser`) — those we must SHOW.
+_HARD_SECRET_RE = re.compile(
+    r"(?i)(secret|pass(?:wd|word|phrase)?|sshpass|token|api[_-]?key|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|credential|_auth)")   # `_auth` = npm .npmrc basic-auth field
+
+def _char_classes(tok: str) -> int:
+    return sum(bool(re.search(p, tok)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
+
+def _is_directive_value(tok: str) -> bool:
+    """A value we must SHOW even under a credential-named key: a filesystem PATH, a shell
+    var-ref, or a known config KEYWORD. These are exactly the sshd/sudoers changes the
+    tool exists to surface (`AuthorizedKeysFile /tmp/evil/keys`, `PasswordAuthentication no`)."""
+    return (tok[:1] in "/~$") or tok.startswith("./") or (tok.lower() in _KW_VALUES)
 
 def redact(line: str) -> str:
-    if _B64LINE_RE.match(line.strip()):
-        return "«redacted (key material)»"
+    # PEM body / raw key material on EITHER side of a unified diff. The char class is
+    # +-agnostic, so strip the one-char diff marker before testing — otherwise a key
+    # body printed raw on a `-` (removed) line while the `+` line is redacted.
+    marker = line[0] if line[:1] in "+-" else ""
+    core = line[1:] if marker else line
+    if _B64LINE_RE.match(core.strip()):
+        return f"{marker}«redacted (key material)»"
     line = _PEM_RE.sub("-----BEGIN PRIVATE KEY----- «redacted»", line)
-    line = _SCHEME_RE.sub(lambda m: f"{m.group(1)} «redacted»", line)
+    # only redact a bearer/basic token that is actually high-entropy — plain prose like
+    # "# basic networking setup" must not become "# basic «redacted» setup".
+    line = _SCHEME_RE.sub(
+        lambda m: f"{m.group(1)} «redacted»" if _char_classes(m.group(2)) >= 2 else m.group(0), line)
     line = _URLAUTH_RE.sub(r"://\1:«redacted»@", line)
+    line = _USERPASS_RE.sub(r"\1«redacted»", line)
     line = _TOKEN_RE.sub("«redacted»", line)
 
     def _kv(m):
-        if "nopasswd" in m.group(1).lower():   # sudoers 'NOPASSWD: ALL' is NOT a secret
+        key, sep, val = m.group(1), m.group(2), m.group(3)
+        if "nopasswd" in key.lower():      # sudoers 'NOPASSWD: ALL' is NOT a secret
             return m.group(0)
-        return f"{m.group(1)}{m.group(2)}«redacted»"
+        tok = val.split()[0] if val.split() else ""
+        if _HARD_SECRET_RE.search(key):
+            # The key literally NAMES a credential, so the value IS the secret.
+            # An assignment (`password=…`, `_auth:…`, `SSHPASS=…`) redacts UNCONDITIONALLY:
+            # a token can begin with '/' (base64 alphabet) or '$' (a crypt/shadow hash), so
+            # a "first char looks like a path/var-ref" test would leak it. A whitespace
+            # separator is prose or a pam/login.defs directive (`password required …`,
+            # `PASS_MAX_DAYS 99999`) — show short/keyword/single-class values, redact only
+            # a credential-shaped one (`password hunter2mixed`).
+            if (":" in sep) or ("=" in sep):
+                return f"{key}{sep}«redacted»"
+            if _is_directive_value(tok) or len(tok) < 6 or _char_classes(tok) < 2:
+                return m.group(0)
+            return f"{key}{sep}«redacted»"
+        # SOFT: the key only CONTAINS a directive name (`AuthorizedKeysFile`,
+        # `AuthorizedKeysCommandUser`, `Authorization`). Its value is a path (absolute OR
+        # relative like `.ssh/authorized_keys`), a username, or a keyword — real token
+        # shapes were already masked by the regexes above. SHOW it, so a malicious
+        # AuthorizedKeys* change stays visible (the whole point of #2).
+        return m.group(0)
     return _KV_RE.sub(_kv, line)
 
 
@@ -481,15 +551,41 @@ def _linux_autostart():
     for base in (HOME / ".config/autostart", Path("/etc/xdg/autostart")):
         for f in sorted(glob.glob(str(base / "*.desktop"))):
             name = os.path.basename(f)
+            content = ""
             try:
-                for line in Path(f).read_text("utf-8", "replace").splitlines():
+                content = Path(f).read_text("utf-8", "replace")
+                for line in content.splitlines():
                     if line.startswith("Name="):
                         name = line.split("=", 1)[1].strip() or name
                         break
             except Exception:
                 pass
-            res[os.path.basename(f)] = name
+            # Fingerprint by CONTENT hash, not Name= alone (parity with the macOS
+            # plist sibling): swapping Exec=/usr/bin/true → Exec=/tmp/miner in an
+            # existing entry keeps Name= identical and would otherwise be invisible in
+            # the highest-signal persistence category.
+            res[os.path.basename(f)] = f"{name} [{sha(content)}]" if content else name
     return res
+
+
+def _systemctl_execstart(scope, units):
+    """{unit -> its effective ExecStart line(s)} via ONE batched `systemctl show`.
+    `show` reflects the LOADED value including `*.service.d/*.conf` drop-in overrides."""
+    execs = {}
+    if not units:
+        return execs
+    out = run(["systemctl"] + scope + ["show", "--no-pager",
+              "--property=Id", "--property=ExecStart"] + units, timeout=15)
+    for block in out.split("\n\n"):
+        uid, lines = None, []
+        for line in block.splitlines():
+            if line.startswith("Id="):
+                uid = line[3:]
+            elif line.startswith("ExecStart="):
+                lines.append(line)
+        if uid:
+            execs[uid] = "\n".join(lines)
+    return execs
 
 
 def _linux_services():
@@ -498,13 +594,21 @@ def _linux_services():
     for scope, tag in (([], ""), (["--user"], "user:")):
         out = run(["systemctl"] + scope + ["list-unit-files", "--type=service,timer",
                    "--state=enabled", "--no-legend", "--no-pager"], timeout=15)
-        for line in out.splitlines():
-            parts = line.split()
-            if parts:
-                res[f"{tag}{parts[0]}"] = parts[1] if len(parts) > 1 else "enabled"
+        units = [p[0] for line in out.splitlines() if (p := line.split())]
+        # Fold each unit's effective ExecStart into the fingerprint — parity with the
+        # macOS plist / Linux .desktop content hash. A swapped ExecStart (or a drop-in
+        # override) on an already-enabled unit is otherwise byte-identical here and would
+        # be invisible in the highest-signal Linux persistence category.
+        execs = _systemctl_execstart(scope, units)
+        for u in units:
+            fp = execs.get(u, "")
+            res[f"{tag}{u}"] = f"enabled [{sha(fp)}]" if fp else "enabled"
     for f in sorted(glob.glob("/etc/init.d/*")):
         if os.path.isfile(f):
-            res[f] = "init.d"
+            try:
+                res[f] = f"init.d [{sha(Path(f).read_text('utf-8', 'replace'))}]"
+            except Exception:
+                res[f] = "init.d"
     return res
 
 
@@ -572,9 +676,18 @@ def _linux_net_config():
                 res[f"DNS {m.group(1)}"] = "nameserver"
     except Exception:
         pass
-    for var in ("http_proxy", "https_proxy", "all_proxy"):
-        if os.environ.get(var):
-            res[f"{var} (env)"] = "set"
+    # SYSTEM-level proxy config, NOT the process environment. Reading os.environ here
+    # reflected whoever ran `since` — a systemd-timer run (no proxy vars) vs an
+    # interactive shell (proxy exported) oscillated a false ORANGE "worth a look" +
+    # notify every day. /etc/environment and profile.d are stable regardless of caller.
+    for src in (Path("/etc/environment"), *[Path(p) for p in sorted(glob.glob("/etc/profile.d/*.sh"))]):
+        try:
+            for line in src.read_text("utf-8", "replace").splitlines():
+                m = re.match(r"\s*(?:export\s+)?(https?_proxy|all_proxy)\s*=\s*(\S+)", line, re.I)
+                if m:
+                    res[f"{m.group(1).lower()} ({src.name})"] = redact(m.group(2).strip('"\''))
+        except Exception:
+            pass
     return res
 
 
@@ -676,7 +789,15 @@ def text_sources() -> dict[str, str]:
         pass
 
     add("crontab (current user)", run(["crontab", "-l"]))
-    for f in ["/etc/crontab"] + sorted(glob.glob("/etc/cron.d/*")):
+    # /etc/sudoers.d/* is the standard drop-in for privilege grants; the cron.* dirs and
+    # the spool are where a real persistence entry would be planted — not just /etc/crontab.
+    cron_sudo = (["/etc/crontab"]
+                 + sorted(glob.glob("/etc/cron.d/*"))
+                 + sorted(glob.glob("/etc/cron.hourly/*")) + sorted(glob.glob("/etc/cron.daily/*"))
+                 + sorted(glob.glob("/etc/cron.weekly/*")) + sorted(glob.glob("/etc/cron.monthly/*"))
+                 + sorted(glob.glob("/var/spool/cron/crontabs/*")) + sorted(glob.glob("/var/spool/cron/*"))
+                 + sorted(glob.glob("/etc/sudoers.d/*")))
+    for f in cron_sudo:
         try:
             if Path(f).is_file():
                 add(f, Path(f).read_text("utf-8", "replace"))
@@ -741,9 +862,12 @@ def _write_private(path: Path, text: str):
     momentarily (snapshots contain .npmrc tokens, .ssh contents, rc-file secrets),
     and a crash mid-write can't leave a truncated file at `path` (temp+rename)."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_EXCL, 0o600)
+    # mkstemp gives a guaranteed-unique temp name, so a stale `.tmp.<pid>` left by a
+    # crashed run (or a reused PID) can no longer collide and raise FileExistsError.
+    fd, tmpname = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmpname)
     try:
+        os.fchmod(fd, 0o600)   # mkstemp is already 0600; be explicit
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
         os.replace(tmp, path)  # atomic on POSIX
@@ -845,7 +969,13 @@ def parse_when(s: str) -> int:
         unit = _UNIT.get(m.group(2))
         if unit:
             n = int(m.group(1)) if m.group(1) else 1
-            return int((now - timedelta(seconds=n * unit)).timestamp())
+            try:
+                return int((now - timedelta(seconds=n * unit)).timestamp())
+            except (OverflowError, OSError, ValueError):
+                # an absurd window (`99999999d`) overflows datetime — semantically that's
+                # "further back than anything we have", so cut off at the epoch (oldest wins)
+                # instead of dumping an uncaught traceback.
+                return 0
     raise ValueError(f"can't understand time '{s}' (try 1d, 12h, yesterday, monday, '3 hours ago')")
 
 
@@ -1046,8 +1176,9 @@ def undo_hint(category: str, key: str, value) -> str | None:
 # normal user; `crontab -l` returns root's vs the user's table. Skipped across a
 # privilege mismatch so they don't fabricate add/remove alarms.
 def _is_priv_blob(key: str) -> bool:
-    return ("/etc/sudoers" in key or key.startswith("crontab")
-            or "/etc/crontab" in key or "/etc/cron.d" in key)
+    return ("/etc/sudoers" in key or key.startswith("crontab")   # sudoers + sudoers.d/*
+            or "/etc/cron" in key or "/var/spool/cron" in key     # crontab, cron.d, cron.daily…, spool
+            or "/etc/ld.so.preload" in key)
 
 
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
@@ -1366,9 +1497,19 @@ def cmd_ignore(args):
             for cat, pat in rules:
                 print(f"  {cat}: {pat}")
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Private state dir/file even when `ignore` is the very first command run (before
+    # any snapshot). mkdir(exist_ok) won't tighten a pre-existing 0755 dir, so chmod too.
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        STATE_DIR.chmod(0o700)
+    except Exception:
+        pass
     with open(IGNORE_FILE, "a") as fh:
         fh.write(args.pattern.strip() + "\n")
+    try:
+        os.chmod(IGNORE_FILE, 0o600)
+    except Exception:
+        pass
     print(f"Ignoring: {args.pattern}")
 
 def cmd_caps(args):
@@ -1480,6 +1621,10 @@ def cmd_diff(args, notify_on=False):
         notes.append(big_note)
 
     if args.json:
+        # The baseline/corrupt-snapshot note (e.g. "N unreadable snapshot(s) skipped",
+        # "using the oldest available") is shown to humans — surface it in --json too so
+        # automation isn't silently comparing against an unexpected baseline.
+        json_notes = ([note] if note and not note.startswith("error:") else []) + notes
         # redact secrets in the diff lines AND the why field so automation / logs
         # consuming --json don't receive tokens in cleartext
         json_findings = []
@@ -1492,7 +1637,7 @@ def cmd_diff(args, notify_on=False):
             json_findings.append(g)
         print(json.dumps({
             "baseline": baseline["created"], "now": current["created"],
-            "as_root": IS_ROOT, "notes": notes,
+            "as_root": IS_ROOT, "notes": json_notes,
             "max_level": LEVEL_NAME[max_level(findings)],
             "findings": json_findings,
             "big_new_files": [{"size": s, "path": p} for s, p in big],

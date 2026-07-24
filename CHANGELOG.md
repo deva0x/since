@@ -2,6 +2,58 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.2] — 2026-07-25
+
+Fixes for a second independent (Kimi) adversarial audit — the v0.3.1 fix round and the
+v0.4 Linux code had introduced new bugs — plus a third independent review pass of this very
+fix batch, which caught two redaction regressions the batch itself introduced. Each fix is
+covered by a regression test (suite now 90 tests).
+
+**Security / correctness (High):**
+- **`redact()` no longer conceals the attacks it exists to surface, and no longer leaks
+  the secrets it should mask.** The rule is now: a key that *names* a credential
+  (`password=`, `SSHPASS=`, `_auth=`, `_authToken=`) has its value redacted unconditionally
+  — including values that begin with `/` (base64 tokens), `$` (crypt/shadow hashes), or `~`;
+  a key that merely *contains* a directive name (`AuthorizedKeysFile`, `AuthorizedKeysCommandUser`)
+  keeps its value visible — including the default *relative-path* form `.ssh/authorized_keys`
+  — so a malicious sshd/sudoers change stays visible.
+- **`redact()` is no longer quadratic.** A long attacker-plantable rc-file line stalled the
+  unattended `digest --notify` for minutes (8.4s @ 20KB → 0.5ms). Key-name runs are bounded.
+- **Private-key / PEM bodies are masked on removed (`-`) diff lines too**, not only `+`.
+- **Linux XDG autostart is fingerprinted by content hash**, so swapping `Exec=` in an
+  existing `.desktop` (same `Name=`) is now detected instead of being invisible.
+
+**Robustness (Medium/Low):**
+- Linux proxy detection reads *system* config (`/etc/environment`, `/etc/profile.d`) instead
+  of the caller's process environment — no more daily false ORANGE from timer-vs-shell.
+- `clean()` neutralizes lone UTF-16 surrogates (a non-UTF-8 Linux filename no longer crashes
+  the report) and now **keeps TAB** (it can't forge a line; stripping it mangled config diffs).
+- `redact()` also masks `SSHPASS=`/bare `pass=` values.
+- `_write_private` uses `mkstemp` — a stale temp from a crashed run (or reused PID) can't
+  crash the next write.
+- `since ignore` as the first-ever command now creates state at 0700 dir / 0600 file.
+- `tilde()` collapses only a *leading* `$HOME`, not every occurrence.
+- `/etc/ld.so.preload` (a rootkit hook) is treated as privilege-sensitive so a root/non-root
+  mismatch can't fabricate an add/remove alarm.
+- `--json` now surfaces the "N unreadable snapshot(s) skipped" / baseline note.
+- `install.sh` quotes the systemd `ExecStart` (repo paths with spaces) and no longer aborts
+  under `set -e` on a headless box with no user systemd session (writes units, reports how to
+  finish).
+
+**From a fourth pass — a full-tool independent audit of the whole file, and a fifth end-to-end
+integration pass through the real pipeline:**
+- `~/.curlrc` credentials (`user = "name:password"`, `-u user:pass`) are now redacted — a real
+  leak in a tracked file that the URL-auth matcher missed, incl. on `+`/`-`-prefixed diff lines
+  (the integration test caught the prefixed form leaking where the bare-line unit test did not).
+- Linux systemd/init.d units now fold their effective `ExecStart` (via `systemctl show`, so
+  drop-in overrides count) into the fingerprint — an `ExecStart` swap on an enabled unit was
+  previously invisible (the macOS plist path already content-hashed; now Linux does too).
+- Sensitive-file monitoring extended to `/etc/sudoers.d/*`, `cron.{daily,hourly,weekly,monthly}`,
+  and the cron spool — the standard drop-in locations a real persistence entry would use.
+- `since --since <absurd>` no longer crashes with an uncaught `OverflowError`.
+- `clean()` also strips U+2028/U+2029 (line/paragraph separators); its comment now matches the
+  code (TAB is kept, by design).
+
 ## [0.4.1] — 2026-07-24
 
 - Linux desktop notifications via `notify-send` (was macOS `osascript` only).

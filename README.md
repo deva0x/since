@@ -110,7 +110,7 @@ since ack                # mark current state as normal — start fresh from her
 since ignore 'listening:com.docker*'   # stop alerting on known-noisy things
 since ignore --list
 
-since snapshot           # capture only (what the daily job runs)
+since snapshot           # capture only, no diff output
 since digest --notify    # diff + desktop notification if 🟠 or worse
 since list               # list saved snapshots (labels shown)
 since --json             # machine-readable, with a max_level field
@@ -212,7 +212,7 @@ silent changes visible.
 
 ```sh
 python3 -m pip install pytest
-python3 -m pytest          # 29 unit tests: diff/severity/time logic, injection-safety,
+python3 -m pytest          # 90 unit tests: diff/severity/time logic, injection-safety,
                            # privilege guard, corruption tolerance, secret redaction
 ```
 

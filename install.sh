@@ -96,7 +96,7 @@ Description=since — daily change digest
 
 [Service]
 Type=oneshot
-ExecStart=${PY} ${REPO_DIR}/since.py digest --notify
+ExecStart="${PY}" "${REPO_DIR}/since.py" digest --notify
 EOF
     cat > "${SYSTEMD_DIR}/since.timer" <<EOF
 [Unit]
@@ -109,11 +109,18 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl --user daemon-reload
-    systemctl --user enable --now since.timer
-    echo "  enabled systemd user timer: since.timer  (output → journalctl --user -u since.service)"
-    echo "  verify with:  systemctl --user list-timers since.timer"
-    echo "  headless box? run once:  sudo loginctl enable-linger \"\$USER\"   (so it fires without a login session)"
+    # Don't let a missing user D-Bus session (headless box, no `loginctl enable-linger`)
+    # abort the whole installer under `set -e`. Write the units regardless, and report
+    # honestly if we couldn't activate the timer so the user can finish the one step.
+    if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now since.timer 2>/dev/null; then
+      echo "  enabled systemd user timer: since.timer  (output → journalctl --user -u since.service)"
+      echo "  verify with:  systemctl --user list-timers since.timer"
+    else
+      echo "  wrote unit files to ${SYSTEMD_DIR}, but could NOT activate the timer"
+      echo "  (no user systemd session — common on headless boxes). To finish:"
+      echo "     sudo loginctl enable-linger \"\$USER\""
+      echo "     systemctl --user daemon-reload && systemctl --user enable --now since.timer"
+    fi
   fi
 else
   echo "  skipped daily job — run 'since snapshot' yourself, or re-run this installer."

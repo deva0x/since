@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "since-cli"
-version = "0.4.1"
+version = "0.4.2"
 description = "A plain-language, severity-ranked daily diff of your Mac or Linux box — startup items, listeners, packages, big new files, and edited system files."
 readme = "README.md"
 requires-python = ">=3.9"

