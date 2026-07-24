@@ -79,7 +79,7 @@ Homebrew). No third-party packages.
 ## Install
 
 ```sh
-git clone <repo-url> since && cd since
+git clone https://github.com/deva0x/since.git && cd since
 ./install.sh
 ```
 
