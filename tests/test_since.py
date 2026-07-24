@@ -64,7 +64,8 @@ def test_base_level():
 
 
 # --------------------------------------------------------------------------- injection safety (C3/M6/M4)
-def test_undo_launch_item_is_shell_safe():
+def test_undo_launch_item_is_shell_safe(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
     mal = "~/Library/LaunchAgents/x'$(touch /tmp/pwned)'.plist"
     real = mal.replace("~", str(since.HOME), 1)
     hint = since.undo_hint("launch_items", mal, None)
@@ -72,13 +73,15 @@ def test_undo_launch_item_is_shell_safe():
     assert "$(touch /tmp/pwned) 2>" not in hint  # never sits outside quoting
 
 
-def test_undo_login_item_uses_argv():
+def test_undo_login_item_uses_argv(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
     hint = since.undo_hint("login_items", 'Evil" name', None)
     assert "item 1 of argv" in hint
     assert shlex.quote('Evil" name') in hint
 
 
-def test_undo_daemon_uses_system_domain():
+def test_undo_daemon_uses_system_domain(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
     hint = since.undo_hint("launch_items", "/Library/LaunchDaemons/evil.plist", None)
     assert "bootout system" in hint and hint.count("sudo") >= 2
 
