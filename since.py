@@ -22,7 +22,13 @@ Common commands:
     since snapshot        just capture a snapshot (put this in a daily job)
     since digest --notify diff + macOS notification if anything's worth a look
     since list            list saved snapshots
+    since caps            show what's covered and what needs sudo
     since --json          machine-readable diff   |   since --all  include quiet churn
+
+Most features need no privileges. A few see more with root — `sudo since` reveals
+system/root-owned listeners and monitors /etc/sudoers; run `since caps` for the list.
+Don't mix privilege levels between snapshots; since detects a mismatch and skips the
+affected categories rather than showing false changes.
 
 Zero dependencies: pure Python 3 stdlib + OS tools. No sudo required.
 State lives in ~/.local/state/since/ (mode 600, never in the repo).
@@ -60,6 +66,24 @@ PLATFORM = "macos" if sys.platform == "darwin" else "linux" if sys.platform.star
 # severity levels (higher = louder)
 RED, ORANGE, YELLOW, GREEN = 3, 2, 1, 0
 LEVEL_NAME = {RED: "critical", ORANGE: "notable", YELLOW: "minor", GREEN: "info"}
+
+IS_ROOT = (os.geteuid() == 0)
+
+# Collectors whose visibility depends on privilege. Without root, `lsof` on macOS
+# only shows the current user's own sockets — root-owned/system listeners are hidden.
+# A root snapshot and a non-root snapshot are therefore NOT directly comparable for
+# these categories (every system listener would look added/removed), so the diff
+# suppresses them across a privilege mismatch to avoid false alarms.
+PRIV_SENSITIVE_CATS = ("listening", "outbound")
+
+# What `sudo` unlocks, for the `caps` command and the non-root footer.
+# (feature, why-root-helps, state-without-root)
+ROOT_FEATURES = [
+    ("Listening services", "lsof shows only your own sockets; system/root listeners are hidden", "partial"),
+    ("Outbound connections", "same — only your processes' sockets are visible", "partial"),
+    ("/etc/sudoers", "unreadable as a normal user, so edits to it aren't monitored", "missing"),
+    ("Background Task Mgmt", "full persistence DB needs `sudo sfltool dumpbtm` (also not yet implemented)", "partial"),
+]
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -444,6 +468,8 @@ def take_snapshot(all_cats=True) -> dict:
         "platform": PLATFORM,
         "created": datetime.now().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
+        "euid": os.geteuid(),
+        "root": IS_ROOT,
         "host": (run(["scutil", "--get", "ComputerName"]).strip()
                  if PLATFORM == "macos" else os.uname().nodename),
         "collectors": {},
@@ -683,10 +709,12 @@ def undo_hint(category: str, key: str, value) -> str | None:
     return None
 
 
-def build_findings(baseline: dict, current: dict, include_quiet=False) -> list[dict]:
+def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=()) -> list[dict]:
     rules = load_ignores()
     findings: list[dict] = []
     for key, meta in CAT.items():
+        if key in skip_cats:
+            continue
         if meta["tier"] == "quiet" and not include_quiet:
             continue
         base = baseline.get("collectors", {}).get(key, {})
@@ -809,13 +837,15 @@ def _describe(f: dict) -> str:
     return f"{verb} {f['label'].lower()}: {paint(tilde(key), 'bold')}"
 
 
-def render(findings, baseline, current, big_files, growing, include_quiet=False) -> str:
+def render(findings, baseline, current, big_files, growing, include_quiet=False, notes=()) -> str:
     L: list[str] = []
     base_dt = datetime.fromisoformat(baseline["created"])
     cur_dt = datetime.fromisoformat(current["created"])
     span = human_duration(current["epoch"] - baseline["epoch"])
     L.append(paint("since — what changed on this computer", "bold"))
     L.append(paint(f"baseline {base_dt:%a %d %b %H:%M}  →  now {cur_dt:%a %d %b %H:%M}   ({span})", "dim"))
+    for n in notes:
+        L.append(paint(f"note: {n}", "yellow"))
 
     loud = [f for f in findings if CAT.get(f["category"], {}).get("tier") == "loud"
             or f["category"] == "config"]
@@ -887,9 +917,15 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False)
             v = "started connecting out" if f["action"] == "added" else "stopped"
             L.append(f"  {paint(LEVEL_DOT[GREEN],'dim')} {f['key']} {paint(v,'dim')}")
 
-    if len(L) <= 2:
+    if len([x for x in L if x]) <= 2 + len(notes):
         L.append("")
         L.append(paint("Nothing changed. 🎉", "green"))
+
+    if not IS_ROOT:
+        L.append("")
+        L.append(paint("🔒 Running without sudo — listening/outbound show only your own processes, "
+                       "and /etc/sudoers isn't watched.", "dim"))
+        L.append(paint("   Full system coverage:  sudo since       Details:  since caps", "dim"))
     return "\n".join(L).rstrip() + "\n"
 
 
@@ -948,6 +984,34 @@ def cmd_ignore(args):
         fh.write(args.pattern.strip() + "\n")
     print(f"Ignoring: {args.pattern}")
 
+def cmd_caps(args):
+    who = run(["whoami"]).strip() or str(os.geteuid())
+    print(paint("since — coverage & privileges", "bold"))
+    print(f"Running as: {who} " + (paint("(root — full coverage)", "green") if IS_ROOT
+                                    else paint("(not root)", "yellow")))
+    print()
+    print(paint("Fully covered without sudo:", "cyan"))
+    print("  login items · startup jobs · kernel/browser/system extensions · DNS & proxy")
+    print("  · software (brew/npm/pip/apps/App Store) · system files · big new files")
+    print()
+    print(paint("Needs sudo for complete coverage:", "cyan"))
+    for feat, why, state in ROOT_FEATURES:
+        if IS_ROOT:
+            tag = paint("[covered]", "green")
+        else:
+            tag = paint("[PARTIAL now]", "yellow") if state == "partial" else paint("[MISSING now]", "red")
+        print(f"  🔒 {feat:<22} {tag}")
+        print(paint(f"       {why}", "dim"))
+    print()
+    if IS_ROOT:
+        print(paint("You're root — all of the above are covered.", "green"))
+    else:
+        print("For full system coverage, run:  " + paint("sudo since", "bold") +
+              "   (or  sudo since digest)")
+        print(paint("Note: don't mix privilege levels — a snapshot taken as root and one taken as", "dim"))
+        print(paint("you aren't comparable for listening/outbound; since detects this and skips them.", "dim"))
+
+
 def cmd_list(args):
     snaps = list_snapshot_paths()
     labels = {v: k for k, v in load_labels().items()}
@@ -976,12 +1040,25 @@ def cmd_diff(args, notify_on=False):
         return
 
     baseline = load_snapshot(baseline_path)
-    findings = build_findings(baseline, current, include_quiet=args.all)
+
+    # A root snapshot and a non-root one see different sets of listeners/outbound
+    # sockets; comparing them would fabricate add/remove churn. Skip those here.
+    notes = []
+    skip = ()
+    if "root" in baseline and baseline.get("root") != current.get("root"):
+        skip = PRIV_SENSITIVE_CATS
+        notes.append("baseline and now were taken at different privilege levels "
+                     f"({'root' if baseline.get('root') else 'user'} vs "
+                     f"{'root' if current.get('root') else 'user'}) — "
+                     "listening/outbound comparison skipped to avoid false alarms.")
+
+    findings = build_findings(baseline, current, include_quiet=args.all, skip_cats=skip)
     big, growing = find_big_new_files(baseline.get("epoch", current["epoch"]))
 
     if args.json:
         print(json.dumps({
             "baseline": baseline["created"], "now": current["created"],
+            "as_root": IS_ROOT, "notes": notes,
             "max_level": LEVEL_NAME[max_level(findings)],
             "findings": [{k: v for k, v in f.items() if k != "diff"} for f in findings],
             "big_new_files": [{"size": s, "path": p} for s, p in big],
@@ -990,7 +1067,8 @@ def cmd_diff(args, notify_on=False):
     else:
         if note:
             print(paint(f"({note})", "dim"))
-        sys.stdout.write(render(findings, baseline, current, big, growing, include_quiet=args.all))
+        sys.stdout.write(render(findings, baseline, current, big, growing,
+                                include_quiet=args.all, notes=notes))
 
     if notify_on and max_level(findings) >= ORANGE:
         loud = [f for f in findings if f["level"] >= ORANGE]
@@ -1031,6 +1109,7 @@ def main(argv=None):
     ig.add_argument("pattern", nargs="?")
     ig.add_argument("--list", action="store_true")
     sub.add_parser("list", help="list saved snapshots")
+    sub.add_parser("caps", help="show what's covered and what needs sudo")
     dg = sub.add_parser("digest", help="diff and optionally notify")
     add_diff_flags(dg)
     dg.add_argument("--notify", action="store_true", help="fire a desktop notification if worth a look")
@@ -1043,7 +1122,7 @@ def main(argv=None):
 
     return {
         "snapshot": cmd_snapshot, "mark": cmd_mark, "ack": cmd_ack,
-        "ignore": cmd_ignore, "list": cmd_list, "digest": cmd_digest,
+        "ignore": cmd_ignore, "list": cmd_list, "caps": cmd_caps, "digest": cmd_digest,
     }.get(args.cmd, cmd_diff)(args)
 
 

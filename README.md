@@ -9,6 +9,9 @@ in human language — **ranked by how much you should care**, with *why* each ch
 probably happened and the command to undo it. Great for catching **both** malware
 persistence **and** your own forgotten `brew install` from three weeks ago.
 
+It's a **single, self-contained command-line tool** — no GUI, no daemon of its own,
+no dependencies. Everything is a subcommand of `since`.
+
 ```
 since — what changed on this computer
 baseline Thu 23 Jul 09:00  →  now Fri 24 Jul 09:00   (about 25 hours)
@@ -117,6 +120,29 @@ fed by per-OS backends.
 
 Your snapshots stay private in `~/.local/state/since/` (mode `600`), never in this repo.
 They describe your machine — treat them as sensitive.
+
+## Root / sudo — what it changes
+
+**`since` runs fine as a normal user and needs no privileges for most of what it does.**
+A few checks see more with `sudo`. Run `since caps` any time for the exact status; it also
+prints a one-line reminder at the bottom of every diff when you're not root.
+
+| Feature | Without sudo | With `sudo since` |
+|---|---|---|
+| **Listening services** | only *your* processes — **system/root-owned listeners are hidden** | all listeners, every user |
+| **Outbound connections** | only your processes' sockets | all sockets |
+| **`/etc/sudoers`** | unreadable — **not monitored** | watched for edits |
+| **Background Task Mgmt** | "Open at Login" list only | *(needs `sfltool dumpbtm` — not implemented yet)* |
+
+Everything else — login items, LaunchAgents/Daemons, kernel/browser/system extensions,
+DNS/proxy, all software inventories, other system files, big files — is **fully covered
+without root**.
+
+> ⚠️ **Don't mix privilege levels.** A snapshot taken with `sudo` sees system listeners a
+> normal one can't, so comparing the two would fabricate "added/removed" churn. `since`
+> stamps each snapshot with its privilege level and **skips listening/outbound across a
+> mismatch** (with a note) rather than lying to you. Pick one: either always run plain, or
+> always run `sudo since` (e.g. make the daily job a root LaunchDaemon).
 
 ## Platform support
 
