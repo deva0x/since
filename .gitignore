@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# since stores snapshots of the local machine under ~/.local/state/since —
+# never in the repo. But guard against a stray local state dir here too:
+state/
+snapshots/
+*.snapshot.json
