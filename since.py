@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -128,6 +129,38 @@ def human_duration(seconds: float) -> str:
 
 def tilde(p: str) -> str:
     return p.replace(str(HOME), "~")
+
+
+# The tool's INPUT is potentially malware-controlled (plist filenames, process
+# names, file contents…). Two dangers when we echo those back:
+#  1. terminal-escape injection — a crafted name/diff line can hide the very
+#     change it describes, or spoof a "signature: Apple-signed" line. Strip all
+#     C0 controls + ESC before anything reaches the terminal.
+#  2. shell/AppleScript injection via the copy-paste `undo:` hints. Never build a
+#     runnable command by string-interpolating an untrusted name; shlex-quote it.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\x1b]")
+
+def clean(s) -> str:
+    """Strip terminal control/escape chars from any attacker-derived string."""
+    return _CTRL_RE.sub("�", s if isinstance(s, str) else str(s))
+
+
+def q(s: str) -> str:
+    """Shell-quote an untrusted value for a copy-paste command."""
+    return shlex.quote(s)
+
+
+# Redact obvious secret material before it reaches the terminal / daily.log.
+# The point of a config diff is "a line was added to ~/.npmrc" — not to reprint
+# the token in that line where it can be shoulder-surfed or logged.
+_SECRET_RE = re.compile(
+    r"(?i)(_auth(?:token)?|authorization|api[_-]?key|secret|password|passwd|token|"
+    r"aws_secret_access_key|client_secret)(\s*[:=]\s*|\s+)\S+")
+_PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
+
+def redact(line: str) -> str:
+    line = _PEM_RE.sub("-----BEGIN PRIVATE KEY----- «redacted»", line)
+    return _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}«redacted»", line)
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +485,13 @@ SENSITIVE_TEXT = ("/etc/hosts", "/etc/sudoers", "sshd_config", "authorized_keys"
 MALICIOUS_PATTERNS = [
     (re.compile(r"curl[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
     (re.compile(r"wget[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
-    (re.compile(r"\bbase64\b\s+-d.*\|\s*(ba)?sh", re.I), "decodes base64 and runs it"),
+    (re.compile(r"(ba)?sh\s+<\(\s*(curl|wget)", re.I), "runs a download via process substitution"),
+    (re.compile(r"\bbase64\b\s+-{1,2}d\w*.*\|\s*(ba)?sh", re.I), "decodes base64 and runs it"),
     (re.compile(r"\bnc\b.*-e\b", re.I), "netcat reverse shell"),
     (re.compile(r"^\s*0\.0\.0\.0\s+\S*[a-z]", re.I | re.M), "redirects a real domain (hosts)"),
+    # 127.0.0.1 mapping a real domain (not localhost/broadcasthost) — phishing redirect
+    (re.compile(r"^\s*127\.0\.0\.1\s+(?!localhost|broadcasthost)\S*\.[a-z]{2,}", re.I | re.M),
+     "redirects a real domain to localhost (hosts)"),
 ]
 
 
@@ -494,19 +531,33 @@ def take_snapshot(all_cats=True) -> dict:
     return snap
 
 
+def _write_private(path: Path, text: str):
+    """Write atomically at mode 0600 — the file is never group/world-readable, even
+    momentarily (snapshots contain .npmrc tokens, .ssh contents, rc-file secrets),
+    and a crash mid-write can't leave a truncated file at `path` (temp+rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)  # atomic on POSIX
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def save_snapshot(snap: dict, label: str | None = None) -> Path:
-    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    SNAP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     name = f"{datetime.fromtimestamp(snap['epoch']):%Y%m%dT%H%M%S}-{snap['epoch']}.json"
     path = SNAP_DIR / name
-    path.write_text(json.dumps(snap, indent=1))
-    try:
-        path.chmod(0o600)
-    except Exception:
-        pass
+    _write_private(path, json.dumps(snap, indent=1))
     if label:
         labels = load_labels()
         labels[label] = name
-        LABELS_FILE.write_text(json.dumps(labels, indent=1))
+        _write_private(LABELS_FILE, json.dumps(labels, indent=1))
     prune_snapshots()
     return path
 
@@ -535,6 +586,16 @@ def list_snapshot_paths() -> list[Path]:
 
 def load_snapshot(path: Path) -> dict:
     return json.loads(path.read_text())
+
+
+def safe_load(path: Path):
+    """load_snapshot but returns None on a corrupt/unreadable snapshot instead of
+    raising — one truncated file (disk-full/power-loss mid-write) must not brick
+    every future `since`/`list` run."""
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -577,21 +638,30 @@ def parse_duration(s: str) -> int:
 
 
 def resolve_baseline(arg: str | None) -> tuple[Path | None, str]:
-    """Return (baseline_path, note). arg may be a label or a time expression."""
+    """Return (baseline_path, note). arg may be a label or a time expression.
+    A note beginning 'error:' means no usable baseline (caller should abort).
+    Corrupt snapshots are excluded so a diff never crashes on one."""
     snaps = list_snapshot_paths()
-    if not snaps:
-        return None, ""
+    loadable = [p for p in snaps if safe_load(p) is not None]
+    corrupt_note = "" if len(loadable) == len(snaps) else \
+        f" ({len(snaps) - len(loadable)} unreadable snapshot(s) skipped)"
+    if not loadable:
+        return None, ("error: all snapshots are unreadable" if snaps else "")
     if arg:
         labels = load_labels()
         if arg in labels:
             p = SNAP_DIR / labels[arg]
-            return (p if p.exists() else snaps[-1]), f"checkpoint '{arg}'"
-        cutoff = parse_when(arg)
-        older = [p for p in snaps if load_snapshot(p).get("epoch", 0) <= cutoff]
+            # Do NOT silently fall back to the newest snapshot — that would diff
+            # against ~now and report "nothing changed", a false clean bill.
+            if not p.exists() or safe_load(p) is None:
+                return None, f"error: checkpoint '{arg}' no longer exists (its snapshot is gone)"
+            return p, f"checkpoint '{arg}'"
+        cutoff = parse_when(arg)  # may raise ValueError; caller handles
+        older = [p for p in loadable if (safe_load(p) or {}).get("epoch", 0) <= cutoff]
         if older:
-            return older[-1], ""
-        return snaps[0], "(no snapshot that old — using the oldest available)"
-    return snaps[-1], ""
+            return older[-1], corrupt_note.strip() and corrupt_note
+        return loadable[0], "(no snapshot that old — using the oldest available)" + corrupt_note
+    return loadable[-1], corrupt_note.strip() and corrupt_note
 
 
 # ---------------------------------------------------------------------------
@@ -606,15 +676,24 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
     for name in BIGFILE_PRUNE:
         prune += ["-name", name, "-prune", "-o"]
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         ref = STATE_DIR / ".bigfile_ref"
         ref.touch()
         os.utime(ref, (since_epoch, since_epoch))
     except Exception:
-        return [], []
+        return [], [], "big-file scan skipped (couldn't create reference marker)"
     cmd = (["find", str(HOME)] + prune
            + ["-type", "f", "-size", f"+{min_mb}M", "-newer", str(ref), "-print0"])
-    out = run(cmd, timeout=25)
+    # Own subprocess call (not run()) so a timeout is distinguishable from "no files"
+    # — otherwise a slow/large HOME silently reports zero big files forever.
+    note = ""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+                             errors="replace").stdout
+    except subprocess.TimeoutExpired:
+        out, note = "", "big-file scan timed out (>25s) — results may be incomplete"
+    except Exception:
+        out, note = "", "big-file scan failed to run"
     try:
         ref.unlink()
     except Exception:
@@ -635,7 +714,7 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
         by_dir[("/".join(parts[:3]) if len(parts) > 3 else os.path.dirname(path))] = \
             by_dir.get("/".join(parts[:3]) if len(parts) > 3 else os.path.dirname(path), 0) + size
     growing = sorted(((v, k) for k, v in by_dir.items() if v > 100 * 1024 * 1024), reverse=True)[:5]
-    return files[:top], growing
+    return files[:top], growing, note
 
 
 # ---------------------------------------------------------------------------
@@ -689,27 +768,45 @@ def base_level(cls: str, action: str) -> int:
 
 
 def undo_hint(category: str, key: str, value) -> str | None:
+    # Every interpolated value is shlex-quoted: `key` can be an attacker-chosen
+    # filename/name, and this string is printed for the user to paste into a shell.
     real = key.replace("~", str(HOME), 1) if key.startswith("~") else key
     if category == "launch_items":
-        return f"launchctl bootout gui/$UID '{real}' 2>/dev/null; rm '{real}'"
+        # /Library/LaunchDaemons live in the system domain and are root-owned —
+        # the gui/$UID + unprivileged rm hint would silently no-op there.
+        if real.startswith("/Library/LaunchDaemons"):
+            return f"sudo launchctl bootout system {q(real)} 2>/dev/null; sudo rm {q(real)}"
+        return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; rm {q(real)}"
     if category == "login_items":
-        return f"osascript -e 'tell application \"System Events\" to delete login item \"{key}\"'"
+        # Pass the name as an argv parameter so it never enters the AppleScript
+        # (or shell) source — a name containing quotes can't break out.
+        return ("osascript -e 'on run argv' "
+                "-e 'tell application \"System Events\" to delete login item (item 1 of argv)' "
+                f"-e 'end run' {q(key)}")
     if category == "brew":
-        return f"brew uninstall {key}"
+        return f"brew uninstall {q(key)}"
     if category == "npm_global":
-        return f"npm rm -g {key}"
+        return f"npm rm -g {q(key)}"
     if category == "pip":
-        return f"pip3 uninstall {key}"
+        return f"pip3 uninstall {q(key)}"
     if category == "browser_extensions":
         return "remove it from your browser's Extensions page"
     if category == "kernel_extensions":
-        return f"sudo kmutil unload -b {key}   # then reboot"
+        return f"sudo kmutil unload -b {q(key)}   # then reboot"
     if category == "system_extensions":
-        return "remove the owning app, or: systemextensionsctl uninstall <team> " + key
+        return f"remove the owning app, or: systemextensionsctl uninstall <team> {q(key)}"
     return None
 
 
-def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=()) -> list[dict]:
+# blobs whose presence/content differs by privilege: sudoers is unreadable as a
+# normal user; `crontab -l` returns root's vs the user's table. Skipped across a
+# privilege mismatch so they don't fabricate add/remove alarms.
+def _is_priv_blob(key: str) -> bool:
+    return "/etc/sudoers" in key or key.startswith("crontab")
+
+
+def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
+                   skip_priv_blobs=False) -> list[dict]:
     rules = load_ignores()
     findings: list[dict] = []
     for key, meta in CAT.items():
@@ -726,13 +823,26 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
             for k, v in items.items():
                 if is_ignored(key, k, rules):
                     continue
-                # port-set churn on an already-known listener is benign noise
+                # quiet-tier categories (outbound) are informational only — never
+                # let them reach the ranked "worth a look" section or fire a notify.
+                level = GREEN if meta["tier"] == "quiet" else base_level(meta["cls"], action)
+                extra = {}
                 if key == "listening" and action == "changed":
-                    continue
+                    # A daemon that rebinds ALL its ports each boot (rapportd) shares
+                    # none with the baseline → benign churn, skip. But a process that
+                    # KEEPS its ports and adds a new one is a backdoor-shaped signal —
+                    # surface exactly the added port(s). (Bug: previously dropped
+                    # entirely, hiding a new listening port from every output mode.)
+                    old_ports = set(str(v[0]).split(","))
+                    new_ports = set(str(v[1]).split(","))
+                    added_ports = sorted(new_ports - old_ports)
+                    if not added_ports or not (old_ports & new_ports):
+                        continue
+                    level = ORANGE
+                    extra["added_ports"] = added_ports
                 f = {"category": key, "label": meta["label"], "cls": meta["cls"],
                      "action": action, "key": k, "value": v,
-                     "level": base_level(meta["cls"], action), "trust": None,
-                     "why": None, "undo": None}
+                     "level": level, "trust": None, "why": None, "undo": None, **extra}
                 _enrich(f, current)
                 findings.append(f)
     # text blobs (system files)
@@ -742,6 +852,8 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
         if ob == oc:
             continue
         if is_ignored("config", key, rules):
+            continue
+        if skip_priv_blobs and _is_priv_blob(key):
             continue
         status = "added" if ob is None else "removed" if oc is None else "changed"
         udiff = list(difflib.unified_diff((ob or "").splitlines(), (oc or "").splitlines(),
@@ -825,16 +937,23 @@ def paint(s, key):
 
 
 def _describe(f: dict) -> str:
-    cat, action, key, val = f["category"], f["action"], f["key"], f["value"]
+    # every interpolated field is clean()'d — key/value can be an attacker-chosen
+    # name carrying terminal escapes meant to hide or spoof this very line.
+    cat, action = f["category"], f["action"]
+    key, val = clean(f["key"]), f["value"]
     verb = {"added": "NEW", "removed": "removed", "changed": "changed"}[action]
     if cat == "listening" and action == "added":
-        return f"{verb} listener: {paint(key, 'bold')} on port(s) {val}"
+        return f"{verb} listener: {paint(key, 'bold')} on port(s) {clean(val)}"
+    if cat == "listening" and action == "changed":
+        added = clean(", ".join(f.get("added_ports", [])))
+        return f"listener {paint(key, 'bold')} now ALSO listening on port(s) {added}"
     if cat == "config":
         tag = {"added": "now tracked", "removed": "gone", "changed": "edited"}[action]
         return f"{key} ({tag})"
     if action == "changed" and isinstance(val, tuple):
-        return f"{verb} {f['label'].lower()}: {tilde(key)} {paint(f'({val[0]} → {val[1]})', 'dim')}"
-    return f"{verb} {f['label'].lower()}: {paint(tilde(key), 'bold')}"
+        return (f"{verb} {f['label'].lower()}: {clean(tilde(f['key']))} "
+                + paint(f"({clean(val[0])} → {clean(val[1])})", "dim"))
+    return f"{verb} {f['label'].lower()}: {paint(clean(tilde(f['key'])), 'bold')}"
 
 
 def render(findings, baseline, current, big_files, growing, include_quiet=False, notes=()) -> str:
@@ -847,10 +966,20 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
     for n in notes:
         L.append(paint(f"note: {n}", "yellow"))
 
-    loud = [f for f in findings if CAT.get(f["category"], {}).get("tier") == "loud"
-            or f["category"] == "config"]
-    inv = [f for f in findings if CAT.get(f["category"], {}).get("cls") == "software"]
-    quiet = [f for f in findings if CAT.get(f["category"], {}).get("tier") == "quiet"]
+    # A finding is "loud" (ranked, shown first) if it's a structurally-alerting
+    # category, a system-file edit, OR anything escalated to ORANGE+ (e.g. an
+    # unsigned app in the inventory-tier Applications category — previously it
+    # rendered as a benign green "+ installed" line with no warning at all).
+    def _is_loud(f):
+        return (f["category"] == "config"
+                or CAT.get(f["category"], {}).get("tier") == "loud"
+                or f["level"] >= ORANGE)
+    loud = [f for f in findings if _is_loud(f)]
+    loud_ids = {id(f) for f in loud}
+    inv = [f for f in findings if CAT.get(f["category"], {}).get("cls") == "software"
+           and id(f) not in loud_ids]
+    quiet = [f for f in findings if CAT.get(f["category"], {}).get("tier") == "quiet"
+             and id(f) not in loud_ids]
 
     # ---- ranked "worth a look" ----
     if loud:
@@ -864,50 +993,56 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
             L.append(f"  {dot} {_describe(f)}")
             if f.get("trust"):
                 tcol = "red" if f["level"] == RED else "dim"
-                L.append("      " + paint(f"signature: {f['trust']}", tcol))
+                L.append("      " + paint(f"signature: {clean(f['trust'])}", tcol))
             if f.get("why"):
-                L.append("      " + paint(f"why: {f['why']}", "dim"))
+                L.append("      " + paint(f"why: {clean(f['why'])}", "dim"))
             if f["category"] == "config" and f.get("diff"):
                 for line in f["diff"][:12]:
+                    safe = clean(redact(line))  # redact secrets, then strip escapes
                     if line.startswith("+"):
-                        L.append("      " + paint(line, "green"))
+                        L.append("      " + paint(safe, "green"))
                     elif line.startswith("-"):
-                        L.append("      " + paint(line, "red"))
+                        L.append("      " + paint(safe, "red"))
                     elif line.startswith("@@"):
-                        L.append("      " + paint(line, "dim"))
+                        L.append("      " + paint(safe, "dim"))
                 if len(f["diff"]) > 12:
                     L.append(paint(f"      … {len(f['diff']) - 12} more changed lines", "dim"))
             if f.get("undo"):
-                L.append("      " + paint(f"undo: {f['undo']}", "dim"))
+                # clean() for terminal safety; the command stays shell-safe because
+                # every interpolated value was shlex-quoted when the hint was built.
+                L.append("      " + paint(f"undo: {clean(f['undo'])}", "dim"))
 
     # ---- software inventory (compact) ----
     if inv:
         L.append("")
         L.append(paint("Software", "cyan"))
-        for f in sorted(inv, key=lambda x: (x["category"], x["key"])):
-            name = f"{f['key']} {f['value'][1] if f['action']=='changed' else ''}".strip()
+        CAP = 40  # don't dump hundreds of lines on a big upgrade wave
+        for f in sorted(inv, key=lambda x: (x["category"], x["key"]))[:CAP]:
+            key = clean(f["key"])
             if f["action"] == "added":
-                line = "  " + paint("+ installed  ", "green") + f["key"] + \
-                       (f" {f['value']}" if f["category"] in ("brew", "npm_global", "pip") else "")
+                line = "  " + paint("+ installed  ", "green") + key + \
+                       (f" {clean(f['value'])}" if f["category"] in ("brew", "npm_global", "pip") else "")
                 if f.get("why"):
-                    line += paint(f"   (from: {f['why']})", "dim")
+                    line += paint(f"   (from: {clean(f['why'])})", "dim")
                 L.append(line)
             elif f["action"] == "changed" and isinstance(f["value"], tuple):
-                L.append("  " + paint("~ updated    ", "yellow") + f"{f['key']} " +
-                         paint(f"{f['value'][0]} → {f['value'][1]}", "dim"))
+                L.append("  " + paint("~ updated    ", "yellow") + f"{key} " +
+                         paint(f"{clean(f['value'][0])} → {clean(f['value'][1])}", "dim"))
             else:
-                L.append("  " + paint("- removed    ", "red") + f["key"])
+                L.append("  " + paint("- removed    ", "red") + key)
+        if len(inv) > CAP:
+            L.append(paint(f"  … +{len(inv) - CAP} more software changes", "dim"))
 
     # ---- disk ----
     if big_files or growing:
         L.append("")
         L.append(paint("Disk — big new files", "cyan"))
         for size, path in big_files:
-            L.append(f"  {human_size(size):>9}  {path}")
+            L.append(f"  {human_size(size):>9}  {clean(path)}")
         if growing:
             L.append(paint("  fastest-growing folders:", "dim"))
             for size, d in growing:
-                L.append(f"    +{human_size(size):>8}  {d}")
+                L.append(f"    +{human_size(size):>8}  {clean(d)}")
         L.append(paint("  (visible folders only — hidden/app-data dirs like ~/Library are skipped)", "dim"))
 
     if quiet:
@@ -915,7 +1050,7 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
         L.append(paint("Outbound connections (noisy — shown because --all)", "cyan"))
         for f in quiet:
             v = "started connecting out" if f["action"] == "added" else "stopped"
-            L.append(f"  {paint(LEVEL_DOT[GREEN],'dim')} {f['key']} {paint(v,'dim')}")
+            L.append(f"  {paint(LEVEL_DOT[GREEN],'dim')} {clean(f['key'])} {paint(v,'dim')}")
 
     if len([x for x in L if x]) <= 2 + len(notes):
         L.append("")
@@ -935,8 +1070,12 @@ def max_level(findings) -> int:
 
 def notify(title: str, message: str):
     if PLATFORM == "macos":
-        msg = message.replace('"', "'")[:220]
-        run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'])
+        # list-form invocation already blocks shell injection; strip quotes,
+        # backslashes and control chars so a crafted name can't break/garble the
+        # AppleScript string (a trailing "\" would escape the closing quote).
+        msg = clean(message).replace("\\", "").replace('"', "'")[:220]
+        ttl = clean(title).replace("\\", "").replace('"', "'")
+        run(["osascript", "-e", f'display notification "{msg}" with title "{ttl}"'])
 
 
 # ---------------------------------------------------------------------------
@@ -1020,13 +1159,24 @@ def cmd_list(args):
         return
     print(f"{len(snaps)} snapshot(s) in {SNAP_DIR}:")
     for p in snaps:
-        s = load_snapshot(p)
-        n = sum(len(v) for v in s.get("collectors", {}).values())
+        s = safe_load(p)
         lab = paint(f"  [{labels[p.name]}]", "cyan") if p.name in labels else ""
+        if s is None:
+            print("  " + paint(f"{'(unreadable)':20}     — corrupt   {p.name}{lab}", "red"))
+            continue
+        n = sum(len(v) for v in s.get("collectors", {}).values())
         print(f"  {s.get('created', '?'):20}  {n:>4} items  {p.name}{lab}")
 
 def cmd_diff(args, notify_on=False):
-    baseline_path, note = resolve_baseline(args.since)
+    try:
+        baseline_path, note = resolve_baseline(args.since)
+    except ValueError as e:  # unparseable --since value
+        print(paint(f"since: {e}", "red"))
+        return 2
+    if note.startswith("error:"):  # missing checkpoint / all snapshots corrupt
+        print(paint(f"since: {note[len('error:'):].strip()}", "red"))
+        return 2
+
     current = take_snapshot()
 
     if baseline_path is None:
@@ -1039,31 +1189,46 @@ def cmd_diff(args, notify_on=False):
             print("No baseline yet and --no-save given; nothing to compare.")
         return
 
-    baseline = load_snapshot(baseline_path)
+    baseline = safe_load(baseline_path)
+    if baseline is None:
+        print(paint("since: the baseline snapshot is unreadable; run `since snapshot` to reset.", "red"))
+        return 2
 
-    # A root snapshot and a non-root one see different sets of listeners/outbound
-    # sockets; comparing them would fabricate add/remove churn. Skip those here.
+    # Privilege guard — FAIL CLOSED. A root snapshot and a non-root one see
+    # different listener/outbound sets and differ on sudoers/crontab, so comparing
+    # them fabricates alarms. Skip those categories+blobs unless we can CONFIRM the
+    # baseline was taken at the same privilege level. Pre-v0.3 snapshots have no
+    # "root" stamp → we can't confirm → skip (previously this failed *open*).
     notes = []
     skip = ()
-    if "root" in baseline and baseline.get("root") != current.get("root"):
-        skip = PRIV_SENSITIVE_CATS
+    skip_priv_blobs = False
+    base_root = baseline.get("root")  # None on unstamped (pre-v0.3) snapshots
+    if base_root is None:
+        skip, skip_priv_blobs = PRIV_SENSITIVE_CATS, True
+        notes.append("baseline predates privilege stamping — listening/outbound and "
+                     "sudoers/crontab comparison skipped (can't confirm same privilege).")
+    elif base_root != current.get("root"):
+        skip, skip_priv_blobs = PRIV_SENSITIVE_CATS, True
         notes.append("baseline and now were taken at different privilege levels "
-                     f"({'root' if baseline.get('root') else 'user'} vs "
+                     f"({'root' if base_root else 'user'} vs "
                      f"{'root' if current.get('root') else 'user'}) — "
-                     "listening/outbound comparison skipped to avoid false alarms.")
+                     "listening/outbound and sudoers/crontab comparison skipped to avoid false alarms.")
 
-    findings = build_findings(baseline, current, include_quiet=args.all, skip_cats=skip)
-    big, growing = find_big_new_files(baseline.get("epoch", current["epoch"]))
+    findings = build_findings(baseline, current, include_quiet=args.all,
+                              skip_cats=skip, skip_priv_blobs=skip_priv_blobs)
+    big, growing, big_note = find_big_new_files(baseline.get("epoch", current["epoch"]))
+    if big_note:
+        notes.append(big_note)
 
     if args.json:
         print(json.dumps({
             "baseline": baseline["created"], "now": current["created"],
             "as_root": IS_ROOT, "notes": notes,
             "max_level": LEVEL_NAME[max_level(findings)],
-            "findings": [{k: v for k, v in f.items() if k != "diff"} for f in findings],
+            "findings": findings,  # includes the "diff" line content for automation
             "big_new_files": [{"size": s, "path": p} for s, p in big],
             "growing_dirs": [{"bytes": s, "dir": d} for s, d in growing],
-        }, indent=2))
+        }, indent=2, default=str))
     else:
         if note:
             print(paint(f"({note})", "dim"))

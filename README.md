@@ -118,8 +118,17 @@ fingerprint per category; a diff is added/removed/changed keys, enriched with se
 signing, attribution and undo. Collectors are **platform-abstracted** — a common schema
 fed by per-OS backends.
 
-Your snapshots stay private in `~/.local/state/since/` (mode `600`), never in this repo.
-They describe your machine — treat them as sensitive.
+Your snapshots stay private in `~/.local/state/since/` (mode `600`, written atomically),
+never in this repo. They describe your machine — treat them as sensitive.
+
+**Hardening.** Because `since`'s *input* can be malware-controlled (a plist filename, a
+process name, a line in an edited config), it treats all of it as hostile: every echoed
+string is stripped of terminal escapes (so a crafted name can't hide the change it
+describes or fake a `signature: Apple-signed`), every value in a copy-paste `undo:`
+command is shell-quoted, obvious secrets (`_authToken`, `PRIVATE KEY`, `export …KEY=`)
+are redacted from rendered diffs, and a corrupt snapshot can't crash or brick the tool.
+When it can't confirm a baseline was taken at the same privilege level, it *skips* the
+privilege-sensitive comparisons rather than firing false alarms.
 
 ## Root / sudo — what it changes
 
