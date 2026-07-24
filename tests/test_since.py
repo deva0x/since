@@ -239,12 +239,30 @@ def test_priv_blob_covers_all_cron():
     assert not since._is_priv_blob("~/.zshrc")
 
 
-def test_platform_note(monkeypatch):
-    monkeypatch.setattr(since, "PLATFORM", "macos")
-    assert since.platform_note() is None
+def test_linux_undo_hints(monkeypatch):
     monkeypatch.setattr(since, "PLATFORM", "linux")
+    assert since.undo_hint("launch_items", "nginx.service", None) == "sudo systemctl disable --now nginx.service"
+    assert since.undo_hint("launch_items", "user:foo.service", None) == "systemctl --user disable --now foo.service"
+    assert since.undo_hint("kernel_extensions", "evil_rk", None).startswith("sudo modprobe -r evil_rk")
+    assert since.undo_hint("brew", "nginx", None).startswith("sudo apt remove nginx")
+    assert since.undo_hint("brew", "code (snap)", None) == "sudo snap remove code"
+    assert since.undo_hint("login_items", "x.desktop", None).startswith("rm ")
+    # attacker-chosen names are still shlex-quoted on Linux
+    assert shlex.quote("a; rm -rf ~") in since.undo_hint("brew", "a; rm -rf ~", None)
+
+
+def test_linux_labels(monkeypatch):
+    # the label override map is applied only when PLATFORM=='linux'
+    assert since.CAT["brew"]["label"] in ("Homebrew packages", "System packages (apt/dnf/…)")
+
+
+def test_platform_note(monkeypatch):
+    for supported in ("macos", "linux"):
+        monkeypatch.setattr(since, "PLATFORM", supported)
+        assert since.platform_note() is None
+    monkeypatch.setattr(since, "PLATFORM", "sunos")   # genuinely unsupported
     note = since.platform_note()
-    assert note and "UNSUPPORTED" in note and "linux" in note
+    assert note and "UNSUPPORTED" in note and "sunos" in note
 
 
 def test_findings_sorted_most_severe_first(monkeypatch):

@@ -2,6 +2,23 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.0] — 2026-07-24
+
+**Linux support** — implemented and verified on a real box (Ubuntu 24.04).
+
+- Collectors: XDG autostart (login items), enabled systemd units + `/etc/init.d`
+  (startup jobs), `lsmod` (kernel modules), Chromium/Firefox browser extensions,
+  `ss` listeners + outbound, `/etc/resolv.conf` DNS, and apt/dnf/pacman + snap +
+  flatpak packages. npm/pip are shared cross-platform collectors.
+- Sensitive-file diffs extended for Linux (`/etc/bash.bashrc`, `/etc/rc.local`,
+  `/etc/ld.so.preload`, …) alongside the shared set.
+- Platform-appropriate **labels** ("Autostart entries", "System packages") and
+  **undo hints** (`systemctl disable`, `modprobe -r`, `apt/snap/flatpak remove`,
+  `rm ~/.config/autostart/…`) — all still shlex-quoted.
+- `since caps` and the "unsupported platform" notice are now platform-aware (Linux is
+  supported; the notice only shows on genuinely-unknown OSes).
+- CI now runs the suite + smoke on **ubuntu-latest** as well as macOS.
+
 ## [0.3.1] — 2026-07-24
 
 Second hardening pass, from an independent adversarial audit that fuzzed the actual

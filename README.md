@@ -171,10 +171,14 @@ without root**.
 ## Platform support
 
 - **macOS** — fully supported and verified.
-- **Linux** — the collector layer is abstracted for it, but Linux backends (systemd,
-  apt/dnf/pacman, `ss`, `~/.config/autostart`, `notify-send`) are **not implemented yet**;
-  they'll be added and verified on a real Linux box. See `PENDING.md`. On Linux today it
-  degrades gracefully (a couple of shared collectors, no crash).
+- **Linux** — supported and verified on a real box. The collector layer is
+  platform-abstracted: on Linux it reads **XDG autostart** (login items), **enabled
+  systemd units + init.d** (startup jobs), **`lsmod`** (kernel modules), Chromium/Firefox
+  **browser extensions**, **`ss`** listeners/outbound, **`/etc/resolv.conf`** DNS, and
+  **apt/dnf/pacman + snap + flatpak** packages — plus the same sensitive-file diffs
+  (shell rc, `/etc/sudoers`, `sshd_config`, cron, `/etc/ld.so.preload`, …). Undo hints
+  and labels are platform-appropriate (`systemctl disable`, `modprobe -r`, `apt remove`).
+  Notifications are macOS-only for now.
 
 ## Limitations (honest ones)
 

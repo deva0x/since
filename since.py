@@ -33,8 +33,9 @@ affected categories rather than showing false changes.
 Zero dependencies: pure Python 3 stdlib + OS tools. No sudo required.
 State lives in ~/.local/state/since/ (mode 600, never in the repo).
 
-macOS is fully supported today. The collector layer is platform-abstracted; Linux
-backends are stubs pending verification on a real Linux box (see PENDING.md).
+macOS and Linux are both supported (verified on real boxes). The collector layer is
+platform-abstracted — per-OS backends feed one common schema, with platform-appropriate
+labels and undo hints. Desktop notifications are macOS-only for now.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 SCHEMA_VERSION = 3
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -461,26 +462,178 @@ def _mac_mas():
     return res
 
 
+# ---------------------------------------------------------------------------
+# Linux backends — feed the SAME common schema as the macOS ones. Verified on a
+# real Linux box; collectors return {} where a concept has no Linux equivalent.
+# ---------------------------------------------------------------------------
+
+def _has(cmd: str) -> bool:
+    return bool(run(["sh", "-c", f"command -v {shlex.quote(cmd)}"]).strip())
+
+
+def _none():
+    return {}
+
+
+def _linux_autostart():
+    """XDG autostart .desktop entries — the Linux 'login items' equivalent."""
+    res = {}
+    for base in (HOME / ".config/autostart", Path("/etc/xdg/autostart")):
+        for f in sorted(glob.glob(str(base / "*.desktop"))):
+            name = os.path.basename(f)
+            try:
+                for line in Path(f).read_text("utf-8", "replace").splitlines():
+                    if line.startswith("Name="):
+                        name = line.split("=", 1)[1].strip() or name
+                        break
+            except Exception:
+                pass
+            res[os.path.basename(f)] = name
+    return res
+
+
+def _linux_services():
+    """Enabled systemd units (system + user) + legacy init scripts — persistence."""
+    res = {}
+    for scope, tag in (([], ""), (["--user"], "user:")):
+        out = run(["systemctl"] + scope + ["list-unit-files", "--type=service,timer",
+                   "--state=enabled", "--no-legend", "--no-pager"], timeout=15)
+        for line in out.splitlines():
+            parts = line.split()
+            if parts:
+                res[f"{tag}{parts[0]}"] = parts[1] if len(parts) > 1 else "enabled"
+    for f in sorted(glob.glob("/etc/init.d/*")):
+        if os.path.isfile(f):
+            res[f] = "init.d"
+    return res
+
+
+def _linux_kmods():
+    """Loaded kernel modules (lsmod) — a NEW module is the signal."""
+    res = {}
+    for line in run(["lsmod"], timeout=10).splitlines()[1:]:
+        parts = line.split()
+        if parts:
+            res[parts[0]] = parts[1] if len(parts) > 1 else ""
+    return res
+
+
+def _linux_browser_extensions():
+    res = {}
+    for base in (HOME / ".config/google-chrome", HOME / ".config/chromium",
+                 HOME / ".config/BraveSoftware/Brave-Browser", HOME / ".config/microsoft-edge"):
+        for ext_dir in glob.glob(str(base / "*/Extensions/*")):
+            ext_id = os.path.basename(ext_dir)
+            name = ext_id
+            mans = sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+            if mans:
+                try:
+                    n = json.loads(Path(mans[-1]).read_text("utf-8", "replace")).get("name", "")
+                    if n and not n.startswith("__MSG_"):
+                        name = n
+                except Exception:
+                    pass
+            res[f"{base.name}:{ext_id}"] = name
+    for ext in glob.glob(str(HOME / ".mozilla/firefox/*/extensions/*")):
+        res[f"firefox:{os.path.basename(ext)}"] = os.path.basename(ext)
+    return res
+
+
+_SS_PROC_RE = re.compile(r'users:\(\("([^"]+)"')
+
+def _linux_listening():
+    """ss -ltnp: listening TCP keyed by process (falls back to lsof if ss absent)."""
+    out = run(["ss", "-H", "-ltnp"], timeout=10)
+    if not out.strip():
+        return _listening()
+    by_cmd: dict[str, set] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        port = parts[3].rsplit(":", 1)[-1]
+        m = _SS_PROC_RE.search(line)
+        by_cmd.setdefault(m.group(1) if m else "?", set()).add(port)
+    return {c: ",".join(sorted(p, key=lambda x: (len(x), x))) for c, p in by_cmd.items() if p}
+
+
+def _linux_outbound():
+    out = run(["ss", "-H", "-tnp", "state", "established"], timeout=10)
+    cmds = {m.group(1) for line in out.splitlines() for m in [_SS_PROC_RE.search(line)] if m}
+    return {c: "connected" for c in sorted(cmds)}
+
+
+def _linux_net_config():
+    res = {}
+    try:
+        for line in Path("/etc/resolv.conf").read_text("utf-8", "replace").splitlines():
+            m = re.match(r"\s*nameserver\s+(\S+)", line)
+            if m:
+                res[f"DNS {m.group(1)}"] = "nameserver"
+    except Exception:
+        pass
+    for var in ("http_proxy", "https_proxy", "all_proxy"):
+        if os.environ.get(var):
+            res[f"{var} (env)"] = "set"
+    return res
+
+
+def _linux_packages():
+    """Primary system package manager + snap + flatpak."""
+    res = {}
+    if _has("dpkg-query"):
+        cmd = ["dpkg-query", "-W", "-f=${Package} ${Version}\n"]
+    elif _has("rpm"):
+        cmd = ["rpm", "-qa", "--qf", "%{NAME} %{VERSION}\n"]
+    elif _has("pacman"):
+        cmd = ["pacman", "-Q"]
+    else:
+        cmd = None
+    if cmd:
+        for line in run(cmd, timeout=40).splitlines():
+            p = line.split()
+            if p:
+                res[p[0]] = p[1] if len(p) > 1 else ""
+    if _has("snap"):
+        for line in run(["snap", "list"], timeout=15).splitlines()[1:]:
+            p = line.split()
+            if p:
+                res[f"{p[0]} (snap)"] = p[1] if len(p) > 1 else ""
+    if _has("flatpak"):
+        for line in run(["flatpak", "list", "--columns=application,version"], timeout=15).splitlines():
+            p = line.split("\t") if "\t" in line else line.split()
+            if p and p[0]:
+                res[f"{p[0].strip()} (flatpak)"] = (p[1].strip() if len(p) > 1 else "")
+    return res
+
+
 # Category registry. Each: key, label, per-platform backend, class, tier.
 #   cls: "persistence" | "network" | "software" | "config-fact"
 #   tier: "loud" (ranked in the digest) | "inventory" | "quiet" (only with --all)
 CATEGORIES = [
-    # key,               label,                       macos,                    linux, cls,            tier
-    ("login_items",      "Login items",               _mac_login_items,         None,  "persistence",  "loud"),
-    ("launch_items",     "Startup/background jobs",    _mac_launch_items,        None,  "persistence",  "loud"),
-    ("kernel_extensions","Kernel extensions",          _mac_kexts,               None,  "persistence",  "loud"),
-    ("browser_extensions","Browser extensions",        _mac_browser_extensions,  None,  "persistence",  "loud"),
-    ("system_extensions","System extensions",          _mac_system_extensions,   None,  "persistence",  "loud"),
-    ("listening",        "Listening network services", _listening,               None,  "network",      "loud"),
-    ("net_config",       "DNS / proxy settings",       _mac_net_config,          None,  "network",      "loud"),
-    ("outbound",         "Outbound connections",       _outbound,                None,  "network",      "quiet"),
-    ("brew",             "Homebrew packages",          _mac_brew,                None,  "software",     "inventory"),
-    ("npm_global",       "Global npm packages",        _npm_global,              None,  "software",     "inventory"),
-    ("pip",              "pip packages",               _pip,                     None,  "software",     "inventory"),
-    ("applications",     "Applications",               _mac_applications,        None,  "software",     "inventory"),
-    ("mac_app_store",    "Mac App Store apps",         _mac_mas,                 None,  "software",     "inventory"),
+    # key,               label,                       macos,                    linux,                    cls,            tier
+    ("login_items",      "Login items",               _mac_login_items,         _linux_autostart,         "persistence",  "loud"),
+    ("launch_items",     "Startup/background jobs",    _mac_launch_items,        _linux_services,          "persistence",  "loud"),
+    ("kernel_extensions","Kernel extensions",          _mac_kexts,               _linux_kmods,             "persistence",  "loud"),
+    ("browser_extensions","Browser extensions",        _mac_browser_extensions,  _linux_browser_extensions,"persistence",  "loud"),
+    ("system_extensions","System extensions",          _mac_system_extensions,   _none,                    "persistence",  "loud"),
+    ("listening",        "Listening network services", _listening,               _linux_listening,         "network",      "loud"),
+    ("net_config",       "DNS / proxy settings",       _mac_net_config,          _linux_net_config,        "network",      "loud"),
+    ("outbound",         "Outbound connections",       _outbound,                _linux_outbound,          "network",      "quiet"),
+    ("brew",             "Homebrew packages",          _mac_brew,                _linux_packages,          "software",     "inventory"),
+    ("npm_global",       "Global npm packages",        _npm_global,              _npm_global,              "software",     "inventory"),
+    ("pip",              "pip packages",               _pip,                     _pip,                     "software",     "inventory"),
+    ("applications",     "Applications",               _mac_applications,        _none,                    "software",     "inventory"),
+    ("mac_app_store",    "Mac App Store apps",         _mac_mas,                 _none,                    "software",     "inventory"),
 ]
 CAT = {c[0]: {"label": c[1], "cls": c[4], "tier": c[5]} for c in CATEGORIES}
+# platform-appropriate labels so a Linux user doesn't see "Homebrew packages"
+if PLATFORM == "linux":
+    for k, lbl in {"login_items": "Autostart entries", "launch_items": "Enabled services / init",
+                   "kernel_extensions": "Kernel modules", "brew": "System packages (apt/dnf/…)",
+                   "applications": "Desktop apps", "mac_app_store": "App store"}.items():
+        if k in CAT:
+            CAT[k]["label"] = lbl
 
 
 def backend_for(cat_key: str):
@@ -498,15 +651,18 @@ def text_sources() -> dict[str, str]:
         if content and content.strip():
             out[label] = content
 
+    # cross-platform sensitive files (most paths exist on both macOS and Linux)
+    common = [HOME / ".bashrc", HOME / ".profile", HOME / ".zshrc", HOME / ".bash_profile",
+              HOME / ".gitconfig", HOME / ".npmrc", HOME / ".curlrc", HOME / ".wgetrc",
+              HOME / ".ssh/config", HOME / ".ssh/authorized_keys",
+              Path("/etc/sudoers"), Path("/etc/ssh/sshd_config"), Path("/etc/profile")]
     if PLATFORM == "macos":
-        rc = [HOME / ".zshrc", HOME / ".zprofile", HOME / ".zshenv", HOME / ".bashrc",
-              HOME / ".bash_profile", HOME / ".profile", HOME / ".config/fish/config.fish",
-              Path("/etc/zshrc"), Path("/etc/zprofile"), Path("/etc/profile"),
-              Path("/etc/bashrc"), Path("/etc/sudoers"), Path("/etc/ssh/sshd_config"),
-              HOME / ".ssh/config", HOME / ".ssh/authorized_keys", HOME / ".gitconfig",
-              HOME / ".npmrc", HOME / ".curlrc", HOME / ".wgetrc"]
-    else:  # deferred; harmless on macOS
-        rc = [HOME / ".bashrc", HOME / ".profile", Path("/etc/hosts")]
+        rc = common + [HOME / ".zprofile", HOME / ".zshenv", HOME / ".config/fish/config.fish",
+                       Path("/etc/zshrc"), Path("/etc/zprofile"), Path("/etc/bashrc")]
+    else:  # linux
+        rc = common + [HOME / ".bash_aliases", HOME / ".bash_logout",
+                       Path("/etc/bash.bashrc"), Path("/etc/rc.local"),
+                       Path("/etc/ld.so.preload")]  # ld.so.preload = a classic rootkit hook
     for p in rc:
         try:
             if p.is_file():
@@ -836,6 +992,35 @@ def undo_hint(category: str, key: str, value) -> str | None:
     # Every interpolated value is shlex-quoted: `key` can be an attacker-chosen
     # filename/name, and this string is printed for the user to paste into a shell.
     real = key.replace("~", str(HOME), 1) if key.startswith("~") else key
+    # cross-platform categories
+    if category == "npm_global":
+        return f"npm rm -g {q(key)}"
+    if category == "pip":
+        return f"pip3 uninstall {q(key)}"
+    if category == "browser_extensions":
+        return "remove it from your browser's Extensions page"
+
+    if PLATFORM == "linux":
+        if category == "login_items":  # XDG autostart .desktop file
+            return f"rm {q(str(HOME / '.config/autostart') + '/' + key)}   # (system copy in /etc/xdg/autostart needs sudo)"
+        if category == "launch_items":
+            if real.startswith("/etc/init.d/"):
+                return f"sudo update-rc.d {q(os.path.basename(real))} disable"
+            unit = key[5:] if key.startswith("user:") else key
+            pre = "systemctl --user" if key.startswith("user:") else "sudo systemctl"
+            return f"{pre} disable --now {q(unit)}"
+        if category == "kernel_extensions":
+            return f"sudo modprobe -r {q(key)}   # blacklist in /etc/modprobe.d to persist"
+        if category == "brew":  # system package
+            base = key.rsplit(" (", 1)[0]
+            if key.endswith("(snap)"):
+                return f"sudo snap remove {q(base)}"
+            if key.endswith("(flatpak)"):
+                return f"flatpak uninstall {q(base)}"
+            return f"sudo apt remove {q(base)}   # (or dnf/pacman remove)"
+        return None
+
+    # macOS
     if category == "launch_items":
         # /Library/LaunchDaemons live in the system domain and are root-owned —
         # the gui/$UID + unprivileged rm hint would silently no-op there.
@@ -850,12 +1035,6 @@ def undo_hint(category: str, key: str, value) -> str | None:
                 f"-e 'end run' {q(key)}")
     if category == "brew":
         return f"brew uninstall {q(key)}"
-    if category == "npm_global":
-        return f"npm rm -g {q(key)}"
-    if category == "pip":
-        return f"pip3 uninstall {q(key)}"
-    if category == "browser_extensions":
-        return "remove it from your browser's Extensions page"
     if category == "kernel_extensions":
         return f"sudo kmutil unload -b {q(key)}   # then reboot"
     if category == "system_extensions":
@@ -1116,13 +1295,13 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
 
 
 def platform_note() -> str | None:
-    """On an unsupported platform most collectors are inactive — say so, so a
-    "nothing changed" isn't mistaken for a clean bill of health."""
-    if PLATFORM == "macos":
+    """macOS and Linux are supported. Anything else runs with most collectors
+    inactive — say so, so a "nothing changed" isn't mistaken for a clean bill."""
+    if PLATFORM in ("macos", "linux"):
         return None
-    return (f"UNSUPPORTED PLATFORM ({PLATFORM}): since is a macOS tool. Here only shell-rc/"
-            "hosts/cron edits and big new files are tracked — most collectors are inactive, "
-            "so 'nothing changed' does NOT mean your system was fully checked. (Linux support is planned.)")
+    return (f"UNSUPPORTED PLATFORM ({PLATFORM}): only shell-rc/hosts/cron edits and big "
+            "new files are tracked here — most collectors are inactive, so 'nothing "
+            "changed' does NOT mean your system was fully checked.")
 
 
 def max_level(findings) -> int:
@@ -1194,11 +1373,19 @@ def cmd_caps(args):
                                     else paint("(not root)", "yellow")))
     print()
     print(paint("Fully covered without sudo:", "cyan"))
-    print("  login items · startup jobs · kernel/browser/system extensions · DNS & proxy")
-    print("  · software (brew/npm/pip/apps/App Store) · system files · big new files")
+    if PLATFORM == "linux":
+        print("  autostart · enabled services/init · kernel modules · browser extensions · DNS")
+        print("  · packages (apt/dnf/snap/flatpak, npm, pip) · system files · big new files")
+        feats = [("Listening services", "ss shows only your own sockets; other users'/system listeners are hidden", "partial"),
+                 ("Outbound connections", "same — process info for other users' sockets needs root", "partial"),
+                 ("/etc/sudoers", "unreadable as a normal user, so edits to it aren't monitored", "missing")]
+    else:
+        print("  login items · startup jobs · kernel/browser/system extensions · DNS & proxy")
+        print("  · software (brew/npm/pip/apps/App Store) · system files · big new files")
+        feats = ROOT_FEATURES
     print()
     print(paint("Needs sudo for complete coverage:", "cyan"))
-    for feat, why, state in ROOT_FEATURES:
+    for feat, why, state in feats:
         if IS_ROOT:
             tag = paint("[covered]", "green")
         else:
