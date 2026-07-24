@@ -19,3 +19,8 @@ VPS-security.md
 CLAUDE.md
 PENDING.md
 docs/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/

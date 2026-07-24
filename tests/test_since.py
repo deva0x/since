@@ -168,11 +168,13 @@ def test_write_private_is_atomic_and_0600(tmp_path):
     assert json.loads(p.read_text()) == {"ok": 1}
 
 
-def test_safe_load_tolerates_corruption(tmp_path):
-    good = tmp_path / "good.json"; good.write_text('{"epoch": 1}')
-    bad = tmp_path / "bad.json"; bad.write_text('{"epoch": 1')  # truncated
-    assert since.safe_load(good) == {"epoch": 1}
-    assert since.safe_load(bad) is None
+def test_safe_load_tolerates_corruption_and_wrong_shape(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"created": "2026-07-24T09:00:00", "epoch": 1, "collectors": {}}))
+    assert since.safe_load(good)["epoch"] == 1
+    for junk in ('{"epoch": 1', "{}", "[]", '{"epoch": 1}', '"a string"'):  # truncated OR valid-but-wrong-shape
+        p = tmp_path / "x.json"; p.write_text(junk)
+        assert since.safe_load(p) is None, junk
 
 
 # --------------------------------------------------------------------------- render never emits raw escapes (H1)
@@ -184,6 +186,59 @@ def test_render_emits_no_raw_escape():
 
 
 # --------------------------------------------------------------------------- severity ordering
+def test_clean_strips_newline_and_bidi():
+    # a newline in a name would inject a forged extra output line (H1 reopened)
+    assert "\n" not in since.clean("legit\n  signature: Apple-signed")
+    assert "\r" not in since.clean("a\rb")
+    assert "\t" not in since.clean("a\tb")
+    assert since.clean("x‮y") == "x�y"   # bidi override
+    assert since.clean("x​y") == "x�y"   # zero-width space
+    assert since.clean("normal name") == "normal name"
+
+
+def test_render_cannot_be_line_injected():
+    # login item whose NAME contains newlines trying to forge a standalone
+    # "signature: Apple-signed" / "undo: rm -rf ~" line
+    b = snap()
+    c = snap(collectors={"login_items": {"evil\n  signature: Apple-signed\n  undo: rm -rf ~": "x"}})
+    out = since.render(since.build_findings(b, c), b, c, [], [])
+    stripped = [l.strip() for l in out.splitlines()]
+    # the forged text must NOT appear as its own line (newline injection defeated)
+    assert "signature: Apple-signed" not in stripped
+    assert "undo: rm -rf ~" not in stripped
+    # it survives only harmlessly inline within one mangled name line
+    assert any("signature: Apple-signed" in l and l.startswith("🟠") for l in stripped)
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("Authorization: Bearer eyJ0.SECRETBODY.sig", "SECRETBODY"),
+    ("GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "ghp_ABCDEF"),
+    ("aws_access_key_id = AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+    ("clone https://user:hunter2@host/x", "hunter2"),
+    ("//r/:_authToken=SEKRIT", "SEKRIT"),
+])
+def test_redact_no_leak(line, secret):
+    assert secret not in since.redact(line)
+
+
+def test_redact_no_false_positive_on_nopasswd():
+    line = "deploy ALL=(ALL) NOPASSWD: ALL"
+    assert since.redact(line) == line   # the security-critical token must stay visible
+
+
+def test_removed_port_on_kept_listener_surfaces():
+    b = snap(collectors={"listening": {"node": "3000,3001"}})
+    c = snap(collectors={"listening": {"node": "3001"}})   # dropped 3000, kept 3001
+    lf = [f for f in since.build_findings(b, c) if f["category"] == "listening"]
+    assert lf and lf[0].get("removed_ports") == ["3000"]
+
+
+def test_priv_blob_covers_all_cron():
+    for k in ("/etc/sudoers", "crontab (current user)", "/etc/crontab", "/etc/cron.d/x"):
+        assert since._is_priv_blob(k), k
+    assert not since._is_priv_blob("~/.zshrc")
+
+
 def test_platform_note(monkeypatch):
     monkeypatch.setattr(since, "PLATFORM", "macos")
     assert since.platform_note() is None

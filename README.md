@@ -180,7 +180,9 @@ without root**.
 
 - Login items use the `System Events` "Open at Login" list; the full Background Task
   Management DB (`sfltool dumpbtm`) needs `sudo` and isn't read yet.
-- Only TCP listeners are tracked (not UDP). New ports on an already-known process aren't flagged.
+- Only TCP listeners are tracked (not UDP). A *new listening process*, and a port added to or
+  dropped from an existing one, are flagged; a daemon that rebinds its entire port set each boot
+  (random-port churn) is intentionally suppressed.
 - Signing check covers startup programs & apps, not live listeners (the process may differ by diff time).
 - The big-file scan is bounded (visible dirs, `> 25 MB`) — not a full disk audit.
 

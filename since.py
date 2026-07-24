@@ -54,7 +54,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 SCHEMA_VERSION = 3
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -143,10 +143,14 @@ def tilde(p: str) -> str:
 #     C0 controls + ESC before anything reaches the terminal.
 #  2. shell/AppleScript injection via the copy-paste `undo:` hints. Never build a
 #     runnable command by string-interpolating an untrusted name; shlex-quote it.
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\x1b]")
+# Strip ALL C0 controls INCLUDING \t \n \r — a newline in an attacker-chosen name
+# would otherwise inject extra output lines and forge e.g. a "signature: Apple-signed"
+# line or a fake "undo:" command. Also strip DEL/C1 and the Unicode format chars used
+# for output spoofing: bidi overrides (Trojan-Source), zero-width chars, and the BOM.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff-\ufeff]")
 
 def clean(s) -> str:
-    """Strip terminal control/escape chars from any attacker-derived string."""
+    """Neutralize terminal control/escape/format chars in any attacker-derived string."""
     return _CTRL_RE.sub("�", s if isinstance(s, str) else str(s))
 
 
@@ -158,14 +162,33 @@ def q(s: str) -> str:
 # Redact obvious secret material before it reaches the terminal / daily.log.
 # The point of a config diff is "a line was added to ~/.npmrc" — not to reprint
 # the token in that line where it can be shoulder-surfed or logged.
-_SECRET_RE = re.compile(
-    r"(?i)(_auth(?:token)?|authorization|api[_-]?key|secret|password|passwd|token|"
-    r"aws_secret_access_key|client_secret)(\s*[:=]\s*|\s+)\S+")
 _PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
+# key=value where the key NAME contains a sensitive word — covers underscore forms
+# (GITHUB_TOKEN, aws_secret_access_key, API_KEY). Value = REST of line (multi-token),
+# so "Authorization: Bearer <jwt>" doesn't leak the token past the first word.
+_KV_RE = re.compile(
+    r"(?i)([\w.\-]*(?:secret|passwd|password|token|api[_-]?key|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|authoriz|_auth)[\w.\-]*)(\s*[:=]\s*|\s+)(\S.*)$")
+_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}")   # auth headers
+_URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
+_TOKEN_RE = re.compile(                                                     # standalone tokens
+    r"\bAKIA[0-9A-Z]{16}\b|\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
+    r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b|\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+_B64LINE_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")                     # PEM body / raw key
 
 def redact(line: str) -> str:
+    if _B64LINE_RE.match(line.strip()):
+        return "«redacted (key material)»"
     line = _PEM_RE.sub("-----BEGIN PRIVATE KEY----- «redacted»", line)
-    return _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}«redacted»", line)
+    line = _SCHEME_RE.sub(lambda m: f"{m.group(1)} «redacted»", line)
+    line = _URLAUTH_RE.sub(r"://\1:«redacted»@", line)
+    line = _TOKEN_RE.sub("«redacted»", line)
+
+    def _kv(m):
+        if "nopasswd" in m.group(1).lower():   # sudoers 'NOPASSWD: ALL' is NOT a secret
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}«redacted»"
+    return _KV_RE.sub(_kv, line)
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +263,10 @@ def attribution_for(term: str) -> str | None:
     """Most recent shell command mentioning `term` (an installed pkg/app name)."""
     if not term:
         return None
-    t = term.lower()
+    word = re.compile(r"(?<![\w-])" + re.escape(term.lower()) + r"(?![\w-])")  # whole-word, not substring
     for cmd in reversed(load_history()):
         cl = cmd.lower()
-        if t in cl and any(v in cl for v in ("install", "add", "brew", "npm", "pip", "-g", "cask", "get")):
+        if word.search(cl) and any(v in cl for v in ("install", "add ", "brew", "npm", "pip", "-g", "cask", "get ")):
             return cmd.strip()[:80]
     return None
 
@@ -254,9 +277,12 @@ def attribution_for(term: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _mac_login_items():
+    # Join names with a newline (not the default comma) so a name containing a comma
+    # (e.g. "Adobe, Inc. Helper") isn't split into phantom items.
     out = run(["osascript", "-e",
-               'tell application "System Events" to get the name of every login item'])
-    return {x.strip(): x.strip() for x in out.split(",") if x.strip()}
+               'set text item delimiters to linefeed\n'
+               'tell application "System Events" to return (name of every login item) as text'])
+    return {x.strip(): x.strip() for x in out.split("\n") if x.strip()}
 
 
 def _mac_launch_items():
@@ -266,8 +292,13 @@ def _mac_launch_items():
     for d in dirs:
         try:
             for p in sorted(d.glob("*.plist")):
-                st = p.stat()
-                out[tilde(str(p))] = f"{st.st_size}:{int(st.st_mtime)}"
+                # Fingerprint by CONTENT hash, not mtime: catches a swapped plist that
+                # preserved mtime (cp -p) and ignores a bare `touch` (mtime-only change).
+                try:
+                    fp = f"{p.stat().st_size}:{sha(p.read_bytes().decode('latin-1'))}"
+                except Exception:
+                    fp = f"{p.stat().st_size}:?"
+                out[tilde(str(p))] = fp
         except Exception:
             pass
     return out
@@ -325,28 +356,33 @@ def _mac_system_extensions():
     return res
 
 
-PORT_RE = re.compile(r":(\d+)\s*\(LISTEN\)")
+_PORT_F_RE = re.compile(r":(\d+)$")
 
 def _listening():
-    out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
+    # lsof field mode (-F): robust against full command names that contain spaces
+    # AND against the default 9-char COMMAND truncation that merged distinct processes
+    # (e.g. python3.11 vs python3.12 both became "python3.1").
+    out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"])
     by_cmd: dict[str, set] = {}
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 9:
+    cur = None
+    for line in out.splitlines():
+        if not line:
             continue
-        m = PORT_RE.search(line)
-        by_cmd.setdefault(parts[0], set()).add(m.group(1) if m else "?")
-    return {c: ",".join(sorted(p, key=lambda x: (len(x), x))) for c, p in by_cmd.items()}
+        tag, val = line[0], line[1:]
+        if tag == "c":
+            cur = val
+            by_cmd.setdefault(cur, set())
+        elif tag == "n" and cur is not None:
+            m = _PORT_F_RE.search(val)
+            if m:
+                by_cmd[cur].add(m.group(1))
+    return {c: ",".join(sorted(p, key=lambda x: (len(x), x))) for c, p in by_cmd.items() if p}
 
 
 def _outbound():
     """Processes with an established outbound TCP connection (churny — quiet tier)."""
-    out = run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"])
-    cmds = set()
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if parts:
-            cmds.add(parts[0])
+    out = run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fc"])
+    cmds = {line[1:] for line in out.splitlines() if line.startswith("c")}
     return {c: "connected" for c in sorted(cmds)}
 
 
@@ -371,6 +407,11 @@ def _mac_brew():
         parts = line.split()
         if parts:
             res[parts[0]] = parts[-1] if len(parts) > 1 else ""
+    # casks (GUI apps installed via brew) — invisible to `brew list --versions`
+    for line in run(["brew", "list", "--cask", "--versions"], timeout=40).splitlines():
+        parts = line.split()
+        if parts:
+            res[f"{parts[0]} (cask)"] = parts[-1] if len(parts) > 1 else ""
     return res
 
 
@@ -401,7 +442,10 @@ def _mac_applications():
         try:
             for entry in sorted(os.listdir(base)):
                 if entry.endswith(".app"):
-                    res[entry[:-4]] = base
+                    # disambiguate ~/Applications from /Applications so a same-named
+                    # app in both doesn't silently overwrite the other
+                    name = entry[:-4] if base == "/Applications" else f"{entry[:-4]} (~/Applications)"
+                    res[name] = base
         except Exception:
             pass
     return res
@@ -556,12 +600,23 @@ def _write_private(path: Path, text: str):
 
 def save_snapshot(snap: dict, label: str | None = None) -> Path:
     SNAP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    name = f"{datetime.fromtimestamp(snap['epoch']):%Y%m%dT%H%M%S}-{snap['epoch']}.json"
-    path = SNAP_DIR / name
+    # mkdir(exist_ok) does NOT tighten a dir that already existed at 0755 (older versions
+    # created it loosely) — snapshots contain secrets, so enforce 0700 every time.
+    for d in (STATE_DIR, SNAP_DIR):
+        try:
+            d.chmod(0o700)
+        except Exception:
+            pass
+    base = f"{datetime.fromtimestamp(snap['epoch']):%Y%m%dT%H%M%S}-{snap['epoch']}"
+    path = SNAP_DIR / f"{base}.json"
+    n = 1
+    while path.exists():  # two snapshots in the same second must not clobber each other
+        n += 1
+        path = SNAP_DIR / f"{base}-{n}.json"
     _write_private(path, json.dumps(snap, indent=1))
     if label:
         labels = load_labels()
-        labels[label] = name
+        labels[label] = path.name
         _write_private(LABELS_FILE, json.dumps(labels, indent=1))
     prune_snapshots()
     return path
@@ -589,18 +644,19 @@ def list_snapshot_paths() -> list[Path]:
     return sorted(SNAP_DIR.glob("*.json")) if SNAP_DIR.is_dir() else []
 
 
-def load_snapshot(path: Path) -> dict:
-    return json.loads(path.read_text())
-
-
 def safe_load(path: Path):
-    """load_snapshot but returns None on a corrupt/unreadable snapshot instead of
-    raising — one truncated file (disk-full/power-loss mid-write) must not brick
-    every future `since`/`list` run."""
+    """load_snapshot but returns None on a corrupt/unreadable/wrong-shape file instead
+    of raising — one truncated OR stray-but-valid-JSON file (an editor autosave, a
+    `cp backup.json`) must not brick every future `since`/`list` run. Validates the
+    required snapshot keys so a `{}` doesn't slip through and later KeyError in render."""
     try:
-        return json.loads(path.read_text())
+        d = json.loads(path.read_text())
     except Exception:
         return None
+    if not (isinstance(d, dict) and "created" in d and "epoch" in d
+            and isinstance(d.get("collectors"), dict)):
+        return None
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -635,11 +691,6 @@ def parse_when(s: str) -> int:
             n = int(m.group(1)) if m.group(1) else 1
             return int((now - timedelta(seconds=n * unit)).timestamp())
     raise ValueError(f"can't understand time '{s}' (try 1d, 12h, yesterday, monday, '3 hours ago')")
-
-
-# backwards-compatible: duration string -> seconds of age
-def parse_duration(s: str) -> int:
-    return int(time.time()) - parse_when(s)
 
 
 def resolve_baseline(arg: str | None) -> tuple[Path | None, str]:
@@ -682,19 +733,28 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
         prune += ["-name", name, "-prune", "-o"]
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        ref = STATE_DIR / ".bigfile_ref"
+        # PID-unique ref file: two concurrent runs must not unlink each other's marker
+        # mid-scan (which would silently truncate results to "no big files").
+        ref = STATE_DIR / f".bigfile_ref.{os.getpid()}"
         ref.touch()
         os.utime(ref, (since_epoch, since_epoch))
     except Exception:
         return [], [], "big-file scan skipped (couldn't create reference marker)"
     cmd = (["find", str(HOME)] + prune
            + ["-type", "f", "-size", f"+{min_mb}M", "-newer", str(ref), "-print0"])
-    # Own subprocess call (not run()) so a timeout is distinguishable from "no files"
-    # — otherwise a slow/large HOME silently reports zero big files forever.
+    # Own subprocess call (not run()) so a timeout / non-zero exit is distinguishable
+    # from "no files" — otherwise a slow/large HOME silently reports zero big files.
     note = ""
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
-                             errors="replace").stdout
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25, errors="replace")
+        out = p.stdout
+        # macOS find returns non-zero for benign TCC/permission-denied on some dirs —
+        # that's expected and not a scan failure. Only surface a note for OTHER errors.
+        if p.returncode != 0:
+            real = [l for l in p.stderr.splitlines()
+                    if l.strip() and "ermission" not in l and "not permitted" not in l.lower()]
+            if real and not out:
+                note = "big-file scan hit an error — results may be incomplete"
     except subprocess.TimeoutExpired:
         out, note = "", "big-file scan timed out (>25s) — results may be incomplete"
     except Exception:
@@ -807,7 +867,8 @@ def undo_hint(category: str, key: str, value) -> str | None:
 # normal user; `crontab -l` returns root's vs the user's table. Skipped across a
 # privilege mismatch so they don't fabricate add/remove alarms.
 def _is_priv_blob(key: str) -> bool:
-    return "/etc/sudoers" in key or key.startswith("crontab")
+    return ("/etc/sudoers" in key or key.startswith("crontab")
+            or "/etc/crontab" in key or "/etc/cron.d" in key)
 
 
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
@@ -835,16 +896,20 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                 if key == "listening" and action == "changed":
                     # A daemon that rebinds ALL its ports each boot (rapportd) shares
                     # none with the baseline → benign churn, skip. But a process that
-                    # KEEPS its ports and adds a new one is a backdoor-shaped signal —
-                    # surface exactly the added port(s). (Bug: previously dropped
-                    # entirely, hiding a new listening port from every output mode.)
+                    # KEEPS a port and gains OR loses another is a real signal: a new
+                    # port is backdoor-shaped (ORANGE), a dropped port means a service
+                    # stopped listening (YELLOW). Previously BOTH were dropped entirely.
                     old_ports = set(str(v[0]).split(","))
                     new_ports = set(str(v[1]).split(","))
                     added_ports = sorted(new_ports - old_ports)
-                    if not added_ports or not (old_ports & new_ports):
-                        continue
-                    level = ORANGE
-                    extra["added_ports"] = added_ports
+                    removed_ports = sorted(old_ports - new_ports)
+                    if not (old_ports & new_ports) or not (added_ports or removed_ports):
+                        continue  # full turnover (churn) or no real change
+                    level = ORANGE if added_ports else YELLOW
+                    if added_ports:
+                        extra["added_ports"] = added_ports
+                    if removed_ports:
+                        extra["removed_ports"] = removed_ports
                 f = {"category": key, "label": meta["label"], "cls": meta["cls"],
                      "action": action, "key": k, "value": v,
                      "level": level, "trust": None, "why": None, "undo": None, **extra}
@@ -901,29 +966,6 @@ def _enrich(f: dict, current: dict):
         f["undo"] = undo_hint(cat, key, f["value"])
 
 
-# thin wrapper kept for the older test harness
-def build_diff(baseline: dict, current: dict) -> dict:
-    result = {"collectors": {}, "blobs": {}}
-    for key in CAT:
-        base = baseline.get("collectors", {}).get(key, {})
-        cur = current.get("collectors", {}).get(key, {})
-        a, r, c = diff_dicts(base, cur)
-        if a or r or c:
-            result["collectors"][key] = {"added": {k: cur[k] for k in a},
-                                         "removed": {k: base[k] for k in r},
-                                         "changed": {k: (base[k], cur[k]) for k in c}}
-    bb, bc = baseline.get("blobs", {}), current.get("blobs", {})
-    for key in sorted(set(bb) | set(bc)):
-        ob, oc = bb.get(key), bc.get(key)
-        if ob == oc:
-            continue
-        entry = {"status": "added" if ob is None else "removed" if oc is None else "changed"}
-        entry["diff"] = list(difflib.unified_diff((ob or "").splitlines(),
-                                                  (oc or "").splitlines(), lineterm="", n=0))[2:]
-        result["blobs"][key] = entry
-    return result
-
-
 # ---------------------------------------------------------------------------
 # rendering
 # ---------------------------------------------------------------------------
@@ -950,8 +992,12 @@ def _describe(f: dict) -> str:
     if cat == "listening" and action == "added":
         return f"{verb} listener: {paint(key, 'bold')} on port(s) {clean(val)}"
     if cat == "listening" and action == "changed":
-        added = clean(", ".join(f.get("added_ports", [])))
-        return f"listener {paint(key, 'bold')} now ALSO listening on port(s) {added}"
+        bits = []
+        if f.get("added_ports"):
+            bits.append("now ALSO on port(s) " + clean(", ".join(f["added_ports"])))
+        if f.get("removed_ports"):
+            bits.append("stopped listening on port(s) " + clean(", ".join(f["removed_ports"])))
+        return f"listener {paint(key, 'bold')} " + "; ".join(bits)
     if cat == "config":
         tag = {"added": "now tracked", "removed": "gone", "changed": "edited"}[action]
         return f"{key} ({tag})"
@@ -1000,7 +1046,7 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
                 tcol = "red" if f["level"] == RED else "dim"
                 L.append("      " + paint(f"signature: {clean(f['trust'])}", tcol))
             if f.get("why"):
-                L.append("      " + paint(f"why: {clean(f['why'])}", "dim"))
+                L.append("      " + paint(f"why: {clean(redact(f['why']))}", "dim"))
             if f["category"] == "config" and f.get("diff"):
                 for line in f["diff"][:12]:
                     safe = clean(redact(line))  # redact secrets, then strip escapes
@@ -1028,7 +1074,7 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
                 line = "  " + paint("+ installed  ", "green") + key + \
                        (f" {clean(f['value'])}" if f["category"] in ("brew", "npm_global", "pip") else "")
                 if f.get("why"):
-                    line += paint(f"   (from: {clean(f['why'])})", "dim")
+                    line += paint(f"   (from: {clean(redact(f['why']))})", "dim")
                 L.append(line)
             elif f["action"] == "changed" and isinstance(f["value"], tuple):
                 L.append("  " + paint("~ updated    ", "yellow") + f"{key} " +
@@ -1242,11 +1288,21 @@ def cmd_diff(args, notify_on=False):
         notes.append(big_note)
 
     if args.json:
+        # redact secrets in the diff lines AND the why field so automation / logs
+        # consuming --json don't receive tokens in cleartext
+        json_findings = []
+        for f in findings:
+            g = dict(f)
+            if "diff" in g:
+                g["diff"] = [redact(l) for l in g["diff"]]
+            if g.get("why"):
+                g["why"] = redact(g["why"])
+            json_findings.append(g)
         print(json.dumps({
             "baseline": baseline["created"], "now": current["created"],
             "as_root": IS_ROOT, "notes": notes,
             "max_level": LEVEL_NAME[max_level(findings)],
-            "findings": findings,  # includes the "diff" line content for automation
+            "findings": json_findings,
             "big_new_files": [{"size": s, "path": p} for s, p in big],
             "growing_dirs": [{"bytes": s, "dir": d} for s, d in growing],
         }, indent=2, default=str))
