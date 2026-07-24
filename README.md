@@ -71,15 +71,30 @@ Every change is ranked so real signal doesn't drown in routine noise:
 - **Malicious-pattern detection** — recognises `curl|bash`, base64-pipe-to-shell,
   netcat reverse shells, and hosts redirects, and escalates them to 🔴.
 
+## Requirements
+
+macOS, and **Python 3.9+** (already present on any Mac with the Command Line Tools or
+Homebrew). No third-party packages.
+
 ## Install
 
 ```sh
+git clone <repo-url> since && cd since
 ./install.sh
 ```
 
 Symlinks `since` into `~/.local/bin` and offers a daily LaunchAgent that runs
 `since digest --notify` each morning — a **desktop notification** whenever something's
 worth a look. (Make sure `~/.local/bin` is on your `PATH`.)
+
+Or install as a command with [pipx](https://pipx.pypa.io):
+
+```sh
+pipx install .
+```
+
+Uninstall: `./install.sh --uninstall` (removes the symlink + LaunchAgent; your snapshots
+are left in place).
 
 ## Commands
 
@@ -171,3 +186,18 @@ without root**.
 
 Not a replacement for real EDR/antivirus — a **friendly daily awareness tool** that makes
 silent changes visible.
+
+## Development
+
+```sh
+python3 -m pip install pytest
+python3 -m pytest          # 29 unit tests: diff/severity/time logic, injection-safety,
+                           # privilege guard, corruption tolerance, secret redaction
+```
+
+CI runs the suite plus a smoke test on macOS across Python 3.9–3.13 (`.github/workflows/ci.yml`).
+Security reports: see [`SECURITY.md`](SECURITY.md). Changes: [`CHANGELOG.md`](CHANGELOG.md).
+
+## License
+
+[MIT](LICENSE).

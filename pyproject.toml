@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "since-cli"
+version = "0.3.0"
+description = "A plain-language, severity-ranked daily diff of your Mac — startup items, listeners, packages, big new files, and edited system files."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["security", "macos", "malware", "persistence", "audit", "diff", "cli"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.scripts]
+since = "since:main"
+
+[tool.setuptools]
+py-modules = ["since"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

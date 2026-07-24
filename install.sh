@@ -5,7 +5,18 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 TARGET="${BIN_DIR}/since"
-PLIST="${HOME}/Library/LaunchAgents/cash.since.daily.plist"
+PLIST="${HOME}/Library/LaunchAgents/dev.since.daily.plist"
+
+# --- uninstall ---------------------------------------------------------------
+if [[ "${1:-}" == "--uninstall" ]]; then
+  echo "since uninstaller"
+  launchctl unload "${PLIST}" 2>/dev/null || true
+  rm -f "${PLIST}" && echo "  removed LaunchAgent (if any)"
+  [[ -L "${TARGET}" ]] && rm -f "${TARGET}" && echo "  removed symlink ${TARGET}"
+  echo "  note: your snapshots in ~/.local/state/since are LEFT IN PLACE."
+  echo "        remove them yourself with:  rm -rf ~/.local/state/since"
+  exit 0
+fi
 
 echo "since installer"
 echo "  repo: ${REPO_DIR}"
@@ -33,7 +44,7 @@ if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>cash.since.daily</string>
+  <key>Label</key><string>dev.since.daily</string>
   <key>ProgramArguments</key>
   <array>
     <string>${PY}</string>

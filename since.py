@@ -54,7 +54,12 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+__version__ = "0.3.0"
 SCHEMA_VERSION = 3
+
+if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
+    sys.exit("since requires Python 3.9 or newer")
+
 HOME = Path.home()
 STATE_DIR = Path(os.environ.get("SINCE_STATE_DIR", HOME / ".local/state/since"))
 SNAP_DIR = STATE_DIR / "snapshots"
@@ -1257,6 +1262,7 @@ def main(argv=None):
         prog="since", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="A plain-language diff of your computer — ranked by how much you should care.",
         epilog=__doc__)
+    ap.add_argument("--version", action="version", version=f"since {__version__}")
     def add_diff_flags(p):
         p.add_argument("--since", metavar="WHEN",
                        help="baseline: a time (1d, 12h, yesterday, monday, '3 hours ago') or a checkpoint label")

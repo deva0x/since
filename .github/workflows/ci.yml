@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test deps
+        run: python -m pip install pytest
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Smoke — version + snapshot + diff in an isolated state dir
+        env:
+          SINCE_STATE_DIR: ${{ runner.temp }}/since-state
+        run: |
+          python since.py --version
+          python since.py snapshot
+          python since.py --no-save
+          python since.py caps

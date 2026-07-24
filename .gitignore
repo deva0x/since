@@ -12,3 +12,10 @@ venv/
 state/
 snapshots/
 *.snapshot.json
+
+# Private working docs kept LOCAL only (personal governance kit) — never publish.
+RULES.md
+VPS-security.md
+CLAUDE.md
+PENDING.md
+docs/
