@@ -2,6 +2,14 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.1] — 2026-07-24
+
+- Linux desktop notifications via `notify-send` (was macOS `osascript` only).
+- `install.sh` sets up a daily **systemd `--user` timer** on Linux (verified on Ubuntu:
+  installs active, uninstalls clean) — previously only the macOS LaunchAgent.
+- README documents that the tool runs **fully offline** (no network code, no deps, no
+  telemetry; the one nuance is macOS `spctl` notarization checks for new signed items).
+
 ## [0.4.0] — 2026-07-24
 
 **Linux support** — implemented and verified on a real box (Ubuntu 24.04).

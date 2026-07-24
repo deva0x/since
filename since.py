@@ -35,7 +35,7 @@ State lives in ~/.local/state/since/ (mode 600, never in the repo).
 
 macOS and Linux are both supported (verified on real boxes). The collector layer is
 platform-abstracted — per-OS backends feed one common schema, with platform-appropriate
-labels and undo hints. Desktop notifications are macOS-only for now.
+labels, undo hints, and desktop notifications (osascript / notify-send).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 SCHEMA_VERSION = 3
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -1316,6 +1316,11 @@ def notify(title: str, message: str):
         msg = clean(message).replace("\\", "").replace('"', "'")[:220]
         ttl = clean(title).replace("\\", "").replace('"', "'")
         run(["osascript", "-e", f'display notification "{msg}" with title "{ttl}"'])
+    elif PLATFORM == "linux":
+        # notify-send: list-form (no shell), "--" ends option parsing so a name
+        # starting with "-" can't be read as a flag; clean() strips controls.
+        # No-ops silently on a headless box (no DBus/display) — that's fine.
+        run(["notify-send", "--", clean(title), clean(message)[:220]])
 
 
 # ---------------------------------------------------------------------------

@@ -136,6 +136,20 @@ fed by per-OS backends.
 Your snapshots stay private in `~/.local/state/since/` (mode `600`, written atomically),
 never in this repo. They describe your machine — treat them as sensitive.
 
+## Privacy — runs fully offline
+
+`since` makes **no network calls of its own**: no networking imports, **zero third-party
+dependencies**, no telemetry, no update check, no analytics, no external endpoints. Your
+snapshots (which can contain tokens and key material) are written locally and never
+uploaded. Everything it does is read local state via standard OS tools.
+
+One honest nuance: to trust-check a **newly added, signed** app or startup item on macOS it
+shells out to Apple's `spctl`, and Gatekeeper *may* contact Apple to verify that item's
+**notarization** — a yes/no check *about that software*, not about you or your data, and only
+for new signed items. On Linux there is no such call; it's entirely offline. (You can grep the
+source: the only external commands are local inspectors — `lsof`/`ss`, `brew`/`dpkg`/…,
+`systemctl`, `find`, etc.)
+
 **Hardening.** Because `since`'s *input* can be malware-controlled (a plist filename, a
 process name, a line in an edited config), it treats all of it as hostile: every echoed
 string is stripped of terminal escapes (so a crafted name can't hide the change it
@@ -178,7 +192,8 @@ without root**.
   **apt/dnf/pacman + snap + flatpak** packages — plus the same sensitive-file diffs
   (shell rc, `/etc/sudoers`, `sshd_config`, cron, `/etc/ld.so.preload`, …). Undo hints
   and labels are platform-appropriate (`systemctl disable`, `modprobe -r`, `apt remove`).
-  Notifications are macOS-only for now.
+  `install.sh` sets up a daily **systemd `--user` timer** (vs. a LaunchAgent on macOS), and
+  notifications use **`notify-send`**.
 
 ## Limitations (honest ones)
 
