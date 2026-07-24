@@ -184,6 +184,14 @@ def test_render_emits_no_raw_escape():
 
 
 # --------------------------------------------------------------------------- severity ordering
+def test_platform_note(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    assert since.platform_note() is None
+    monkeypatch.setattr(since, "PLATFORM", "linux")
+    note = since.platform_note()
+    assert note and "UNSUPPORTED" in note and "linux" in note
+
+
 def test_findings_sorted_most_severe_first(monkeypatch):
     monkeypatch.setattr(since, "trust_of", lambda p: (None, False))
     b = snap()

@@ -24,6 +24,8 @@ First public release.
   (random-port daemons) is suppressed.
 - A missing checkpoint errors instead of silently diffing against ~now; a bad `--since`
   reports a clean error; the big-file scan reports a timeout instead of showing nothing.
+- On a non-macOS platform the tool now prints a clear "unsupported platform" notice, so a
+  "nothing changed" isn't mistaken for a full clean bill of health (found by running it on Linux).
 
 ### Added
 - `--version`; `since caps` (coverage vs. what needs `sudo`); `mark`/`ack`/`ignore`;

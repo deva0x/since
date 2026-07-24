@@ -1069,6 +1069,16 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
     return "\n".join(L).rstrip() + "\n"
 
 
+def platform_note() -> str | None:
+    """On an unsupported platform most collectors are inactive — say so, so a
+    "nothing changed" isn't mistaken for a clean bill of health."""
+    if PLATFORM == "macos":
+        return None
+    return (f"UNSUPPORTED PLATFORM ({PLATFORM}): since is a macOS tool. Here only shell-rc/"
+            "hosts/cron edits and big new files are tracked — most collectors are inactive, "
+            "so 'nothing changed' does NOT mean your system was fully checked. (Linux support is planned.)")
+
+
 def max_level(findings) -> int:
     return max((f["level"] for f in findings), default=GREEN)
 
@@ -1094,6 +1104,9 @@ def _snap_and_report(label=None, quiet_msg=False):
     if not quiet_msg:
         tag = f" as '{label}'" if label else ""
         print(f"Snapshot saved{tag}: {path.name}  ({n} items, {len(snap['collectors'])} categories)")
+        pn = platform_note()
+        if pn:
+            print(paint("  " + pn, "yellow"))
         real_errs = {k: v for k, v in snap["errors"].items() if "no backend" not in v}
         if real_errs:
             print(paint(f"  note: collector issue(s): {', '.join(real_errs)}", "dim"))
@@ -1205,6 +1218,9 @@ def cmd_diff(args, notify_on=False):
     # baseline was taken at the same privilege level. Pre-v0.3 snapshots have no
     # "root" stamp → we can't confirm → skip (previously this failed *open*).
     notes = []
+    pn = platform_note()
+    if pn:
+        notes.append(pn)
     skip = ()
     skip_priv_blobs = False
     base_root = baseline.get("root")  # None on unstamped (pre-v0.3) snapshots
