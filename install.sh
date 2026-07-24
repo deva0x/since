@@ -38,7 +38,8 @@ if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
   <array>
     <string>${PY}</string>
     <string>${REPO_DIR}/since.py</string>
-    <string>snapshot</string>
+    <string>digest</string>
+    <string>--notify</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
