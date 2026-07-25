@@ -9,6 +9,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import time
 
@@ -1233,6 +1234,8 @@ def test_oversized_plist_is_not_parsed(monkeypatch, tmp_path):
 
 # #7 — `ProgramArguments = ["/bin/sh","-c","curl …|sh"]` resolves to /bin/sh, which IS
 # Apple-signed, so the report printed a reassuring signature beside a malicious startup item.
+@pytest.mark.skipif(shutil.which("plutil") is None,
+                    reason="parses a real plist via plutil (macOS only)")
 def test_interpreter_argv_escalates_over_its_signature(tmp_path):
     pl = tmp_path / "com.evil.plist"
     pl.write_text('<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0"><dict>'
@@ -1336,3 +1339,13 @@ def test_malicious_scan_still_detects_real_payloads():
                          ("0.0.0.0 www.apple.com", "redirects")]:
         hits = " ".join(since.malicious_hits(line))
         assert expect in hits, (line, hits)
+
+
+def test_changed_persistence_item_is_escalated_everywhere(monkeypatch):
+    """The other half of the hijack fix, with no plutil dependency: overwriting an EXISTING
+    startup item used to be a quiet YELLOW hash change. Must hold on Linux (systemd units) too."""
+    monkeypatch.setattr(since, "trust_of", lambda p: (None, False))
+    b = snap(collectors={"launch_items": {"nginx.service": "enabled [aaaa]"}})
+    c = snap(collectors={"launch_items": {"nginx.service": "enabled [bbbb]"}})
+    f = next(x for x in since.build_findings(b, c) if x["category"] == "launch_items")
+    assert f["action"] == "changed" and f["level"] >= since.ORANGE
