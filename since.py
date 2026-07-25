@@ -343,9 +343,13 @@ _SUDO_TAGS = ("PASSWD", "NOPASSWD")
 # more TAGS (`PASSWD:NOEXEC: /tmp/miner`) or a comma list (`ALL, !/usr/bin/su`). The v0.4.3
 # gate tested only `tok == "ALL" or tok[0] in "/!"`, so both ordinary spellings still had the
 # granted command list redacted away — the single most important thing in a sudoers diff.
-_SUDO_CMD_RE = re.compile(r"^(?:ALL(?=$|[\s,:=])|[/!])")   # \b also matched `ALL,<secret>`
+# `ALL` must be followed by end/space/comma — NOT ':' or '=': `NOPASSWD: ALL=<secret>` was
+# accepted as a command spec and exempted the whole value. (`\b` was even looser.)
+_SUDO_CMD_RE = re.compile(r"^(?:ALL(?=$|[\s,])|[/!])")
+# No re.I: sudoers tags are UPPERCASE by spec, and case-insensitivity let a lowercase token
+# pose as "a further tag" and exempt the rest of the line (`NOPASSWD: passwd: <secret>`).
 _SUDO_TAG_RE = re.compile(r"^(?:NO)?(?:PASSWD|EXEC|SETENV|LOG_INPUT|LOG_OUTPUT|"
-                          r"MAIL|FOLLOW|INTERCEPT):", re.I)
+                          r"MAIL|FOLLOW|INTERCEPT):")
 # Keys whose VALUE is a FILESYSTEM PATH even though the key names a credential: every one is
 # a known credential-theft / agent-hijack technique when planted in a tracked rc file
 # (SSH_ASKPASS=/tmp/steal.sh, SSH_AUTH_SOCK=/tmp/.evil/agent.sock, PGPASSFILE=…), and the
@@ -353,7 +357,11 @@ _SUDO_TAG_RE = re.compile(r"^(?:NO)?(?:PASSWD|EXEC|SETENV|LOG_INPUT|LOG_OUTPUT|"
 # A real filesystem path, i.e. one with a directory separator — NOT merely "starts with / ~ $".
 # The looser test leaked: a base64 secret starts with '/' about 1 time in 64 and every
 # crypt/bcrypt hash starts with '$', so `SECRET_FILE=/hunter2…` printed in cleartext.
+# A real filesystem path: needs a directory separator, OR is a single absolute segment of low
+# entropy (`SSH_ASKPASS=/evil` is a genuine hijack shape; `SECRET_FILE=/hunter2Xyz9` has 4
+# character classes and stays masked).
 _REAL_PATH_RE = re.compile(r"^(?:/[^/\s]+/|~/|\./|\.\./|\$\{?\w+\}?/)")
+_SIMPLE_PATH_RE = re.compile(r"^/[^/\s]+$")
 # `$VAR` / `${VAR}` in full: a reference, not a value. Requires a LETTER or '_' first, so a
 # crypt/shadow hash (`$6$rounds$…`) is not mistaken for one and still redacts.
 _VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_]\w*\}?$")
@@ -445,8 +453,14 @@ def redact(line: str) -> str:
         masked = f"{key}{sep}«redacted»"  # output keeps the original key, marker included
         assigned = (":" in sep) or ("=" in sep)
 
-        if (m.start("key") > 0 and m.string[m.start("key") - 1] == "/" and not assigned):
-            return m.group(0)                                              # 1
+        # (The former rule 1 — "a key preceded by '/' is a path component, show it" — is GONE.
+        # It leaked a token passed as argv to a credential-named script: `*/5 * * * *
+        # /opt/bin/refresh_token <secret>` and `/etc/foo/api_key <secret>` printed in cleartext.
+        # There is no structural difference between that and `/tmp/token_stealer.sh <host>`, so
+        # the tie is broken toward NOT leaking: the following token is masked, and the line still
+        # names the script and the grant. The case the rule was added for — `NOPASSWD:
+        # /usr/bin/passwd backdoor2026` — is unaffected: rule 1 below consumes the command path
+        # as the tag's value, so the account name is never scanned as a value at all.)
         if kcls in _SUDO_TAGS and ":" in sep and _sudo_cmd_spec(bare):
             return m.group(0)                                              # 2
         if _HARD_SECRET_RE.search(kcls):                                    # 3
@@ -458,7 +472,9 @@ def redact(line: str) -> str:
                 # path-valued key. (The whitespace branch below can afford the exemption: its
                 # values are directives, e.g. nginx `Authorization $http_authorization;`.)
                 if (bare.lower() in _KW_VALUES
-                        or (_PATH_VALUED_KEY_RE.search(kcls) and _REAL_PATH_RE.match(bare))):
+                        or (_PATH_VALUED_KEY_RE.search(kcls)
+                            and (_REAL_PATH_RE.match(bare)
+                                 or (_SIMPLE_PATH_RE.match(bare) and _char_classes(bare) < 3)))):
                     return m.group(0)
                 return masked
             # keyword / short / single-class only. NOT "starts with / ~ $": that first-char
@@ -1086,10 +1102,24 @@ def malicious_hits(text: str) -> set:
     length here AND the patterns' own runs above keeps the scan linear."""
     hits = set()
     for line in text.splitlines():
-        line = line[:_REDACT_MAX]
-        for pat, desc in MALICIOUS_PATTERNS:
-            if desc not in hits and pat.search(line):
-                hits.add(desc)
+        # CHUNK, don't truncate. `line[:_REDACT_MAX]` meant a payload appended after 4KB of
+        # padding ON ONE LINE was never flagged — which re-opened the very hole blob_flags was
+        # added to close (past BLOB_MAX the diff text is gone too, so the finding lost RED and
+        # its "why"). Overlap by more than the longest bounded run so nothing hides on a seam.
+        for start in range(0, max(len(line), 1), _SCAN_CHUNK - _SCAN_OVERLAP):
+            window = line[start:start + _SCAN_CHUNK]
+            for pat, lit, desc in MALICIOUS_PATTERNS_LIT:
+                # required-literal pre-filter first: `curl[^\n|]*\|` is unbounded in the same
+                # way `.*` is (it just excludes two characters), so it is quadratic in line
+                # length — 8MB of 4096-column `curl ` lines cost 20-56s at SNAPSHOT time. A
+                # `str.find` for the literal the pattern cannot match without is linear and
+                # rejects those lines outright: 20225ms -> 58ms, detection unchanged.
+                if desc in hits or (lit and lit not in window):
+                    continue
+                if pat.search(window):
+                    hits.add(desc)
+            if len(window) < _SCAN_CHUNK:
+                break
     return hits
 
 
@@ -1172,6 +1202,24 @@ MALICIOUS_PATTERNS = [
     # 127.0.0.1 mapping a real domain (not localhost/broadcasthost) — phishing redirect
     (re.compile(r"^\s*127\.0\.0\.1\s+(?!localhost|broadcasthost)\S*\.[a-z]{2,}", re.I | re.M),
      "redirects a real domain to localhost (hosts)"),
+]
+# The same patterns paired with a literal each one CANNOT match without. `str.find` is linear
+# and rejects a whole window before the regex engine runs, which is what makes the scan safe on
+# attacker-sized input: `curl[^\n|]*\|` is unbounded in exactly the way `.*` is (it merely
+# excludes two characters) and so is quadratic in LINE LENGTH — 8MB of 4096-column `curl `
+# lines measured 20-56s at snapshot time, before any snapshot is saved.
+# A literal here MUST be a substring every match contains, or detection is silently lost;
+# test_malicious_literals_are_implied_by_their_pattern pins that.
+_SCAN_CHUNK = 4096
+_SCAN_OVERLAP = 512          # > the longest bounded run (400) so no payload hides on a seam
+MALICIOUS_PATTERNS_LIT = [
+    (MALICIOUS_PATTERNS[0][0], "|", MALICIOUS_PATTERNS[0][1]),
+    (MALICIOUS_PATTERNS[1][0], "|", MALICIOUS_PATTERNS[1][1]),
+    (MALICIOUS_PATTERNS[2][0], "<(", MALICIOUS_PATTERNS[2][1]),
+    (MALICIOUS_PATTERNS[3][0], "|", MALICIOUS_PATTERNS[3][1]),
+    (MALICIOUS_PATTERNS[4][0], "-e", MALICIOUS_PATTERNS[4][1]),
+    (MALICIOUS_PATTERNS[5][0], "0.0.0.0", MALICIOUS_PATTERNS[5][1]),
+    (MALICIOUS_PATTERNS[6][0], "127.0.0.1", MALICIOUS_PATTERNS[6][1]),
 ]
 
 
