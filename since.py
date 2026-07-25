@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -669,12 +669,31 @@ def attribution_for(term: str) -> str | None:
 
 def _mac_login_items():
     need("osascript")
+    # name AND path. Keyed by display name alone, three attacks were completely invisible:
+    # planting an app named after an existing login item, retargeting an existing item at another
+    # binary, and — because no path was collected — NO signature check was possible, so login
+    # items could never escalate to RED while the equivalent LaunchAgent did. The `undo:` hint
+    # also deleted by name, i.e. the wrong entry under a collision.
     # Join names with a newline (not the default comma) so a name containing a comma
     # (e.g. "Adobe, Inc. Helper") isn't split into phantom items.
-    out = run_checked(["osascript", "-e",
-               'set text item delimiters to linefeed\n'
-               'tell application "System Events" to return (name of every login item) as text'])
-    return {x.strip(): x.strip() for x in out.split("\n") if x.strip()}
+    out = run_checked(["osascript",
+                       "-e", "set out to {}",
+                       "-e", 'tell application "System Events"',
+                       "-e", "repeat with li in login items",
+                       "-e", "set end of out to (name of li) & tab & (path of li)",
+                       "-e", "end repeat",
+                       "-e", "end tell",
+                       "-e", "set text item delimiters to linefeed",
+                       "-e", "return out as text"], timeout=20)
+    res = {}
+    for line in out.split("\n"):
+        if not line.strip():
+            continue
+        name, _tab, path = line.partition("\t")
+        # key on the PATH (stable identity, and the trust-check target); fall back to the name on
+        # an older macOS that will not report a path.
+        res[(path.strip() or name.strip())] = name.strip() or path.strip()
+    return res
 
 
 def _mac_launch_items():
@@ -1730,6 +1749,8 @@ def undo_hint(category: str, key: str, value) -> str | None:
             return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; sudo rm -- {q(real)}"
         return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; rm -- {q(real)}"
     if category == "login_items":
+        # the key is the item's PATH now, but System Events deletes by name — which is the value.
+        key = value if isinstance(value, str) and value else key
         # The name is passed as an argv PARAMETER so it never enters the AppleScript
         # source, and q() quotes it for the shell. Neither is sufficient on its own:
         # `osascript` parses ITS OWN options out of argv, so a login item named
@@ -1917,8 +1938,11 @@ def recover_baselines(current: dict, unusable, baseline: dict | None = None) -> 
 
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
                    skip_priv_blobs=False, coverage: dict | None = None,
-                   skip_blobs=False) -> list[dict]:
+                   skip_blobs=False, stats: dict | None = None) -> list[dict]:
     rules = load_ignores()
+    if stats is not None:
+        stats["rules"] = len(rules)
+        stats.setdefault("ignored", 0)
     findings: list[dict] = []
     for key, meta in CAT.items():
         if key in skip_cats:
@@ -1937,7 +1961,15 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                               ("removed", {k: base[k] for k in removed}),
                               ("changed", {k: (base[k], cur[k]) for k in changed})):
             for k, v in items.items():
-                if is_ignored(key, k, rules):
+                # An ignore rule must never silence a CRITICAL finding, and suppressions are
+                # always disclosed. A user's own broad rule — the README suggests
+                # `listening:com.docker*` — can be matched by an attacker-chosen process name,
+                # and nothing in either output said that rules were active or that N findings
+                # had been hidden.
+                ignored = is_ignored(key, k, rules)
+                if ignored and base_level(meta["cls"], action) < RED:
+                    if stats is not None:
+                        stats["ignored"] = stats.get("ignored", 0) + 1
                     continue
                 # quiet-tier categories (outbound) are informational only — never
                 # let them reach the ranked "worth a look" section or fire a notify.
@@ -1972,6 +2004,9 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                 f = {"category": key, "label": meta["label"], "cls": meta["cls"],
                      "action": action, "key": k, "value": v,
                      "level": level, "trust": None, "why": None, "undo": None, **extra}
+                if ignored:
+                    f["why"] = ("an ignore rule matched this, but a critical finding is never "
+                                "silenced")
                 # Enrichment (trust check, attribution, undo hint) parses ATTACKER-WRITTEN
                 # files at diff time. Collectors are all failure-isolated; this path was not,
                 # and `main` catches only KeyboardInterrupt — so one malformed plist killed
@@ -1988,8 +2023,7 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
         ob, oc = bb.get(key), bc.get(key)
         if ob == oc:
             continue
-        if is_ignored("config", key, rules):
-            continue
+        cfg_ignored = is_ignored("config", key, rules)
         if skip_priv_blobs and _is_priv_blob(key):
             continue
         status = "added" if ob is None else "removed" if oc is None else "changed"
@@ -2033,6 +2067,13 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
             worse = [d for d, n in cur_f.items() if n > base_f.get(d, 0)]
             if worse:
                 level, why = RED, sorted(worse)[0]
+        if cfg_ignored and level < RED:
+            if stats is not None:
+                stats["ignored"] = stats.get("ignored", 0) + 1
+            continue
+        if cfg_ignored:
+            why = (why or "") + " [an ignore rule matched this, but a critical finding is never" \
+                                " silenced]"
         findings.append({"category": "config", "label": "System files", "cls": "config",
                          "action": status, "key": key, "value": None, "level": level,
                          "trust": None, "why": why, "undo": None, "diff": udiff})
@@ -2052,6 +2093,11 @@ def _enrich(f: dict, current: dict):
     # signing/trust for new persistence programs & apps
     # persistence: check "changed" too — overwriting an EXISTING plist is the classic hijack,
     # and it previously got only a YELLOW content-hash line with no trust check and no notify.
+    if action == "added" and cat == "login_items" and key.startswith("/"):
+        label, suspicious = trust_of(key)
+        f["trust"] = label
+        if suspicious:
+            f["level"] = RED
     if action in ("added", "changed") and cat == "launch_items":
         prog, argv = plist_program_and_argv(key)
         if prog:
@@ -2459,8 +2505,12 @@ def cmd_diff(args, notify_on=False):
                      f"{'root' if current.get('root') else 'user'}) — "
                      "listening/outbound and sudoers/crontab comparison skipped to avoid false alarms.")
 
+    ig_stats: dict = {}
     findings = build_findings(baseline, current, coverage=lost, include_quiet=args.all,
-                              skip_cats=skip, skip_priv_blobs=skip_priv_blobs)
+                              skip_cats=skip, skip_priv_blobs=skip_priv_blobs, stats=ig_stats)
+    if ig_stats.get("ignored"):
+        notes.append(f"{ig_stats['ignored']} finding(s) hidden by {ig_stats.get('rules', 0)} "
+                     f"ignore rule(s) — see {STATE_DIR}/ignore.txt")
     big, growing, big_note = find_big_new_files(baseline.get("epoch", current["epoch"]))
     if big_note:
         notes.append(big_note)

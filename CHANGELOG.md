@@ -2,6 +2,71 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.6] — 2026-07-25
+
+A **fourth** adversarial round, pointed for the first time at the surfaces the previous five had
+never examined — the collectors, the render path, and the ignore rules. It was the most productive
+round of the project: 20 findings, and the worst were not in the heavily-audited `redact()` but in
+code nobody had attacked. Suite 526 → **656**; **87/87 mutations** caught.
+
+**A broken helper silently emptied its category.** `lsof`, `osascript`, `scutil`, `kextstat` and
+`systemextensionsctl` returned `""` on a timeout or non-zero exit, so the collector reported an
+EMPTY category. The diff reads that as "every listener / login item / DNS entry was removed", the
+next day as "all of them are new" with the attacker's port among them — and if the tool stays
+broken, both snapshots are empty and the report says **"Nothing changed 🎉" while a backdoor
+listens**. `SECURITY.md` promises a skip *with a note*; only a raised error delivers that. All of
+them now use `need()` + `run_checked`, and `coverage_lost` no longer requires a tool stamp — which
+only 4 of 13 categories have, so the nine loudest categories could never reach ORANGE at all.
+
+**An unsigned binary named `sh` fell out of RED (a regression from v0.4.5).** The interpreter
+caveat added in 0.4.5 *cleared* the `suspicious` flag, and the basename is attacker-chosen — so
+`cp miner ~/Library/.../sh` dropped an unsigned payload from RED to YELLOW, stopped `--notify`
+firing, and replaced its "unsigned" label with a reassuring explanation. The caveat is now
+appended, never substituted. Relatedly, an Apple-signed binary **copied outside** the system paths
+(the `cp /bin/sh` laundering trick) is now suspicious in its own right.
+
+**Collectors that could not see the attack at all:**
+- **Browser extensions** were fingerprinted by display name, so overwriting `background.js`,
+  adding `<all_urls>`/`cookies`/`webRequest`, or swapping the `.xpi` were invisible in a
+  user-writable directory. Now version + manifest hash (size+mtime for Firefox `.xpi`), and
+  version directories sort numerically — lexically, `1.10.0_0` read as older than `1.9.0_0`, so
+  the OLD manifest was being reported.
+- **Login items** were keyed *and* fingerprinted by display name with no path collected: planting
+  an app named after an existing item, or retargeting an existing item, was invisible, and without
+  a path no signature check was possible — they could never reach RED while the equivalent
+  LaunchAgent did. Now keyed on path, trust-checked, with the name kept for the undo hint.
+  *One-time effect: existing login items appear once as removed+added as the keys change.*
+- **Kernel extensions**: `startswith("com.apple")` is a string test, not provenance, so naming a
+  rootkit `com.apple.driver.AudioHelper` removed it from the report entirely — and real
+  third-party prefixes (`co.`, `dev.`, `me.`) were never collected.
+- **Listeners**: the anti-churn rule ("no port overlap ⇒ churn") silently dropped a single-port
+  rebind (`8080 → 4444`) and a backdoor sharing a churny process name. Only an all-ephemeral
+  multi-port set is churn now.
+- **Linux `.socket` and `.path` units** — standard user-level persistence — were never collected.
+- **Applications**: the trust check rebuilt the bundle path from the KEY, so `Calculator
+  (cask).app` printed *another app's* signature and `Evil (snap).app` pointed at nothing; the
+  collector now stores the real path.
+
+**Severity and disclosure:**
+- Creating a tracked config file was YELLOW while editing one was ORANGE — so planting `~/.zshenv`
+  (sourced by every zsh) was the *quieter* attack. Now ORANGE, and rendered as "NEW FILE".
+- An **ignore rule can no longer silence a critical finding**, and suppressions are disclosed
+  ("N finding(s) hidden by M ignore rule(s)"). The README's own example rule can be matched by an
+  attacker-chosen process name, and nothing previously said rules were even active.
+
+**`redact()` leaks closed:** an unlisted auth scheme absorbed the mask and printed the credential
+(`Authorization: SSWS <token>`, a real `.curlrc` line); a quoted value past the old 512-char bound
+leaked its tail; a separator run (`:=`, `=>`, `==`, `=""`) left the secret as the next token.
+
+**Three of my own attempted fixes were reverted after measuring them** — a whitespace-scheme rule
+masked `pam_deny.so` and, worse, masked the wrong token while leaving real secrets; a mask-tail
+pass broke compositionality by eating shell separators; and a payload-path exemption leaked base64
+tokens, because base64 uses `/` so they match "looks like a path". All three are documented
+residuals with the reasoning rather than silent reverts.
+
+Also: `find`'s partial output is kept on timeout instead of discarded (a false all-clear on a large
+HOME), and a corrupt `labels.json` no longer unprotects checkpoints from pruning.
+
 ## [0.4.5] — 2026-07-25
 
 Two further adversarial rounds against v0.4.4, then a **restructure of `redact()`** and its first

