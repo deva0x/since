@@ -2047,3 +2047,15 @@ def test_ignored_findings_are_counted_for_disclosure(monkeypatch, tmp_path):
     f = since.build_findings(b, c, stats=stats)
     assert not [x for x in f if x["category"] == "listening"]     # still suppressed (ORANGE)
     assert stats == {"rules": 1, "ignored": 1}                    # …but counted for the note
+
+
+# Found on cycle 1 of the multi-day trial: with no baseline, `--json` printed HUMAN TEXT on stdout
+# and exited 0, so a consumer could only detect the first-run case by failing to parse it.
+@pytest.mark.parametrize("extra", [[], ["--no-save"]])
+def test_json_output_is_always_json(tmp_path, extra):
+    p = _run_cli(tmp_path, ["--json", *extra])          # empty state dir: no baseline exists
+    assert p.returncode == 0, p.stderr[-400:]
+    payload = json.loads(p.stdout)                       # must parse, not raise
+    assert payload["baseline"] is None and payload["findings"] == []
+    assert payload["notes"] and "no baseline" in payload["notes"][0]
+    assert (payload["first_snapshot"] is None) == bool(extra)

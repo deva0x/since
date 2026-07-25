@@ -2451,6 +2451,19 @@ def cmd_diff(args, notify_on=False):
     current = take_snapshot()
 
     if baseline_path is None:
+        # `--json` must ALWAYS emit JSON on stdout. It used to print human text here and exit 0,
+        # so a consumer could only discover the first-run case by failing to parse it — found on
+        # the first cycle of the multi-day trial run, by the observer harness doing exactly that.
+        if args.json:
+            first = None if args.no_save else save_snapshot(current)
+            print(json.dumps({"schema": SCHEMA_VERSION, "baseline": None,
+                              "created": current["created"], "findings": [], "big_files": [],
+                              "max_level": LEVEL_NAME[GREEN], "as_root": IS_ROOT,
+                              "notes": ["no baseline yet — this run establishes one"
+                                        if first else "no baseline yet and --no-save given"],
+                              "first_snapshot": str(first) if first else None}, indent=1,
+                             default=str))
+            return
         if not args.no_save:
             path = save_snapshot(current)
             print(paint("First snapshot saved — this is your baseline.", "bold"))
