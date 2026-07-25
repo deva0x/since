@@ -1861,6 +1861,8 @@ def test_lost_coverage_covers_untooled_categories():
 # #2 (HIGH) — `cp /bin/sh ~/Library/.../SoftwareUpdateHelper` keeps the Apple signature, and the
 # interpreter check was basename-only, so the report printed "signature: Apple-signed" beside
 # attacker-planted persistence.
+@pytest.mark.skipif(since.PLATFORM != "macos" or shutil.which("codesign") is None,
+                    reason="needs macOS codesign")
 def test_apple_signed_binary_outside_system_paths_is_suspicious(tmp_path):
     import subprocess as sp
     copy = tmp_path / "SoftwareUpdateHelper"
