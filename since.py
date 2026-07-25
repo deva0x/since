@@ -1350,8 +1350,16 @@ def prune_snapshots():
             pass
 
 
+# Snapshots are ordered by FILENAME (which we write as <timestamp>-<epoch>[-n].json, so lexical
+# order is chronological). Names are therefore validated: the state dir is user-writable, and a
+# planted `99999999T999999-9999999999.json` sorted last and simply BECAME the baseline.
+_SNAP_NAME_RE = re.compile(r"^\d{8}T\d{6}-\d{9,12}(?:-\d+)?\.json$")
+
+
 def list_snapshot_paths() -> list[Path]:
-    return sorted(SNAP_DIR.glob("*.json")) if SNAP_DIR.is_dir() else []
+    if not SNAP_DIR.is_dir():
+        return []
+    return sorted(p for p in SNAP_DIR.glob("*.json") if _SNAP_NAME_RE.match(p.name))
 
 
 def safe_load(path: Path):
@@ -1366,9 +1374,22 @@ def safe_load(path: Path):
         d = json.loads(safe_read_text(path) or "")
     except Exception:
         return None
-    if not (isinstance(d, dict) and "created" in d and "epoch" in d
+    if not (isinstance(d, dict) and isinstance(d.get("created"), str)
+            and isinstance(d.get("epoch"), (int, float)) and not isinstance(d.get("epoch"), bool)
             and isinstance(d.get("collectors"), dict)):
         return None
+    # Field TYPES, not just presence: `created` reaches datetime.fromisoformat and a blob value
+    # reaches .splitlines(), so an int in either raised out of an unisolated path — no snapshot
+    # saved, same bad file re-read tomorrow, dead every day (the class this release fixed four
+    # times over). A future epoch means a planted or clock-broken file, not a baseline.
+    if d["epoch"] > time.time() + 86400:
+        return None
+    blobs = d.get("blobs")
+    if blobs is not None:
+        if not isinstance(blobs, dict):
+            return None
+        d["blobs"] = {k: v for k, v in blobs.items()
+                      if isinstance(k, str) and (v is None or isinstance(v, str))}
     return d
 
 

@@ -1263,8 +1263,8 @@ def test_recover_baselines_walks_back_to_a_usable_snapshot(monkeypatch, tmp_path
         s["errors"] = err or {}
         (tmp_path / name).write_text(json.dumps(s))
         return s
-    day1 = write("20260101T000000-1.json", {"jq": "1.7"})
-    write("20260102T000000-2.json", {}, tool="", err={"brew": "not on PATH: brew"})  # blind day
+    day1 = write("20260101T000000-1767225600.json", {"jq": "1.7"})
+    write("20260102T000000-1767312000.json", {}, tool="", err={"brew": "not on PATH: brew"})  # blind day
     day3 = snap(collectors={"brew": {"jq": "1.7", "evilminer": "1.0"}})
     day3["tools"] = {"brew": "/opt/homebrew/bin/brew"}
     rec = since.recover_baselines(day3, {"brew": "was blind"})
@@ -1278,7 +1278,7 @@ def test_recover_baselines_requires_the_same_tool(monkeypatch, tmp_path):
     monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
     s = snap(collectors={"brew": {"jq": "1.7"}})
     s["tools"] = {"brew": "/usr/local/bin/brew"}          # a DIFFERENT brew
-    (tmp_path / "20260101T000000-1.json").write_text(json.dumps(s))
+    (tmp_path / "20260101T000000-1767225600.json").write_text(json.dumps(s))
     cur = snap(collectors={"brew": {"jq": "1.7"}})
     cur["tools"] = {"brew": "/opt/homebrew/bin/brew"}
     assert since.recover_baselines(cur, {"brew": "x"}) == {}   # never compare across tools
@@ -1715,3 +1715,42 @@ def test_long_curl_command_cannot_push_the_pipe_out_of_the_window():
     assert since.malicious_hits(short), "a normal-length curl|sh must be detected"
     for pat, _lit, _desc in since.MALICIOUS_PATTERNS_LIT:
         assert "[^\\n|]*" not in pat.pattern, f"unbounded run in {pat.pattern!r}"
+
+
+# Pre-existing crash-permanence shapes (present since v0.4.3) and a baseline-selection hole:
+# the state dir is user-writable, so a planted filename simply BECAME the baseline.
+@pytest.mark.parametrize("obj", [
+    {"created": "2026-07-24T09:00:00", "epoch": 1784000000, "collectors": {},
+     "blobs": {"~/.zshrc": 5}},                      # blob value reaches .splitlines()
+    {"created": 12345, "epoch": 1784000000, "collectors": {}},   # reaches fromisoformat
+    {"created": "2026-07-24T09:00:00", "epoch": "x", "collectors": {}},
+    {"created": "2026-07-24T09:00:00", "epoch": True, "collectors": {}},
+    {"created": "2026-07-24T09:00:00", "epoch": 1784000000, "collectors": {}, "blobs": 7},
+    {"created": "2026-07-24T09:00:00", "epoch": 4070908800, "collectors": {}},   # far future
+])
+def test_safe_load_validates_field_types(tmp_path, obj):
+    p = tmp_path / "20260724T090000-1784000000.json"
+    p.write_text(json.dumps(obj))
+    loaded = since.safe_load(p)
+    if loaded is not None:                    # accepted -> it must be SAFE to diff and render
+        loaded.setdefault("root", False)
+        loaded.setdefault("euid", 501)
+        cur = snap(blobs={"~/.zshrc": "x\n"})
+        findings = since.build_findings(loaded, cur)      # must not raise
+        since.render(findings, loaded, cur, [], [])        # nor here (fromisoformat)
+
+
+def test_planted_snapshot_cannot_become_the_baseline(monkeypatch, tmp_path):
+    """The state dir is user-writable and snapshots are ordered by filename, so a planted
+    `99999999T999999-…json` sorted last and became the baseline. Two defenses: the name must
+    match what we write (kills `zzzz-evil.json`), and a FUTURE epoch is refused by safe_load
+    (kills the all-nines name, which is syntactically legal). Test the outcome, not one layer."""
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    monkeypatch.setattr(since, "LABELS_FILE", tmp_path / "labels.json")
+    (tmp_path / "20260725T090000-1784000000.json").write_text(json.dumps(snap(epoch=1784000000)))
+    (tmp_path / "99999999T999999-9999999999.json").write_text(json.dumps(snap(epoch=4070908800)))
+    (tmp_path / "zzzz-evil.json").write_text(json.dumps(snap(epoch=4070908800)))
+    assert "zzzz-evil.json" not in [p.name for p in since.list_snapshot_paths()]
+    path, _note = since.resolve_baseline(None)
+    assert path is not None and path.name == "20260725T090000-1784000000.json", path
+    assert since.safe_load(tmp_path / "99999999T999999-9999999999.json") is None
