@@ -1758,3 +1758,34 @@ def test_planted_snapshot_cannot_become_the_baseline(monkeypatch, tmp_path):
     path, _note = since.resolve_baseline(None)
     assert path is not None and path.name == "20260725T090000-1784000000.json", path
     assert since.safe_load(tmp_path / "99999999T999999-9999999999.json") is None
+
+
+# install.sh is shell, but this bug silently disabled ALL monitoring on any box with a missing
+# PATH entry, so it gets a test: `_add_dir` must return 0 on every path, or `set -euo pipefail`
+# aborts the installer right after the first snapshot with no error shown.
+def test_installer_add_dir_never_returns_nonzero(tmp_path):
+    import subprocess
+    installer = pathlib.Path(since.__file__).resolve().parent / "install.sh"
+    src = installer.read_text()
+    start = src.index("  _add_dir() {")
+    end = src.index("  }", start) + 4
+    fn = src[start:end].replace("  _add_dir", "_add_dir", 1)
+    script = f'set -euo pipefail\nJOB_PATH=""\n{fn}\n' + "\n".join([
+        '_add_dir /definitely/not/a/real/dir',      # missing -> must NOT abort under set -e
+        '_add_dir /usr',                            # present
+        '_add_dir /usr',                            # duplicate -> early return
+        '_add_dir relative/path',                   # non-absolute
+        'echo "JOB_PATH=$JOB_PATH"',
+    ])
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, f"installer would abort: rc={p.returncode}\n{p.stderr}"
+    assert "JOB_PATH=/usr" in p.stdout, p.stdout
+
+
+def test_installer_parses_and_has_no_bare_return_after_a_test():
+    import subprocess
+    installer = pathlib.Path(since.__file__).resolve().parent / "install.sh"
+    assert subprocess.run(["bash", "-n", str(installer)]).returncode == 0
+    # the exact shape that caused it: `[ ... ] || return` with no explicit status
+    assert "|| return\n" not in installer.read_text(), \
+        "`|| return` propagates status 1 under set -e — use an explicit `return 0`"
