@@ -76,6 +76,31 @@ NOISE_PREFIX = ["", "export ", "  ", "\t", "set -x; ", "# ", "if true; then ", "
 NOISE_SUFFIX = ["", " # comment", " || true", " ; echo done", " 2>/dev/null", " && ls"]
 
 
+# Shape-based secrets: masked by the passes that run BEFORE the assignment scan. No property
+# exercised them, so deleting every one of those passes still passed all 176 cases (verified by
+# mutation) — the whole PEM/bearer/URL/token layer was untested at the property level.
+SHAPE_SECRETS = [
+    ("-----BEGIN OPENSSH PRIVATE KEY-----", "BEGIN OPENSSH PRIVATE KEY"),
+    ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abcdefgh.ijklmnop", "eyJhbGciOiJIUzI1NiJ9"),
+    ("Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNzd29yZDEyMw"),
+    ("Authorization: Token c2VjcmV0dG9rZW4xMjM0NQ", "c2VjcmV0dG9rZW4xMjM0NQ"),
+    ("git remote add o https://user:hunter2Mixed@github.com/x", "hunter2Mixed"),
+    ('[url "https://aB3xYz9Qw2mN7pL1kJ4h@github.com/"]', "aB3xYz9Qw2mN7pL1kJ4h"),
+    ("export AWS_KEY=AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+    ("gh auth: ghp_abcdefghijklmnopqrstuvwxyz0123456789", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+    ("stripe sk_live_abcdefghijklmnop1234", "sk_live_abcdefghijklmnop1234"),
+    ("slack xoxb-1234567890-abcdefghijkl", "xoxb-1234567890-abcdefghijkl"),
+    ("*/5 * * * * sshpass -p Tr0ub4dor3 ssh a@h", "Tr0ub4dor3"),
+    ("mysqldump -u root -pTr0ub4dor3 db", "Tr0ub4dor3"),
+    ("curl -u bob:hunter2Mixed https://x", "hunter2Mixed"),
+]
+# Whole-line ONLY: a raw key body is recognised when it IS the line (`_B64LINE_RE` is anchored),
+# which is how a PEM block looks. Deliberately NOT matched mid-line: the base64 alphabet is a
+# superset of hex, so a 40-char git SHA in a comment or config would be redacted as "key
+# material". Residual, accepted: a commented-out key body (`# AAAA…`) is shown.
+WHOLE_LINE_SECRETS = [("A" * 64, "A" * 64), ("b" * 50 + "==", "b" * 50)]
+
+
 def _credential_value(rng):
     """A value that is unmistakably credential-shaped: >=6 chars and >=2 character classes,
     which is exactly the threshold `redact()` uses to distinguish a secret from a keyword."""
@@ -86,6 +111,13 @@ def _credential_value(rng):
         # a marker substring we can search for in the output, and the shape gate must agree
         if since._char_classes(val) >= 2 and len(val) >= 6 and not val.startswith("-"):
             return val
+
+
+def _single_class_value(rng):
+    """A LOW-entropy secret (one character class). The whitespace-separator branch shows these by
+    design (`password required pam_unix.so`), but an assignment must still mask them — and no
+    property generated one, so a mutant that ignored `:` separators entirely passed all 176."""
+    return "".join(rng.choice(string.ascii_lowercase) for _ in range(rng.randint(8, 24)))
 
 
 def _lines_with_secret(rng, count):
@@ -143,6 +175,59 @@ def test_property_chained_commands_are_each_scanned(seed):
                 + key + rng.choice(["=", ": "]) + secret)
         out = since.redact(line)
         assert secret not in out, f"seed={seed} LEAK after a shown value\n  in : {line!r}\n  out: {out!r}"
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_property_secret_in_a_long_line_is_masked(seed):
+    """A secret far into a long line must still be masked. Nothing generated lines longer than a
+    couple of hundred characters, so a mutant that bailed out above 200 chars passed everything."""
+    rng = random.Random(seed + 2024)
+    for _ in range(120):
+        secret = _credential_value(rng)
+        key = rng.choice(CREDENTIAL_KEYS)
+        pad_before = "# " + "x" * rng.randint(100, 1800)
+        pad_after = " " + "y" * rng.randint(0, 1800)
+        line = f"{rng.choice(MARKERS)}{pad_before}; {key}={secret}{pad_after}"
+        assert len(line) < since._REDACT_MAX, "keep it under the truncation cap"
+        out = since.redact(line)
+        assert secret not in out, f"seed={seed} LEAK at offset {line.index(secret)}: {out[:90]!r}"
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_property_low_entropy_value_still_masked_when_assigned(seed):
+    rng = random.Random(seed + 3033)
+    for _ in range(150):
+        secret = _single_class_value(rng)
+        key = rng.choice(CREDENTIAL_KEYS)
+        for sep in ("=", ": ", ":", " = "):
+            line = f"{rng.choice(MARKERS)}{key}{sep}{secret}"
+            out = since.redact(line)
+            assert secret not in out, f"seed={seed} LEAK (low entropy, assigned): {out!r}"
+
+
+@pytest.mark.parametrize("line,secret", WHOLE_LINE_SECRETS)
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_whole_line_key_material_is_masked(line, secret, marker):
+    """Anchored by design (see WHOLE_LINE_SECRETS) — must hold on both diff markers, since a key
+    body once printed raw on the `-` side while the `+` side was masked."""
+    assert secret not in since.redact(marker + line)
+
+
+@pytest.mark.parametrize("line,secret", SHAPE_SECRETS)
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_shape_based_secrets_are_masked(line, secret, marker):
+    """The pre-assignment passes (PEM, bearer/basic/token, URL creds, standalone token shapes,
+    command-flag creds). Deleting all of them passed every property before this existed."""
+    assert secret not in since.redact(marker + line)
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_property_shape_secrets_survive_surrounding_noise(seed):
+    rng = random.Random(seed + 4044)
+    for _ in range(120):
+        line, secret = rng.choice(SHAPE_SECRETS)
+        noisy = (rng.choice(MARKERS) + rng.choice(NOISE_PREFIX) + line + rng.choice(NOISE_SUFFIX))
+        assert secret not in since.redact(noisy), f"seed={seed} LEAK: {since.redact(noisy)[:90]!r}"
 
 
 # --------------------------------------------------------------- P2: never hide
