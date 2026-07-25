@@ -422,7 +422,13 @@ def redact(line: str) -> str:
         # `NOPASSWD: /usr/bin/passwd backdoor2026` the "key" is the command being granted, and
         # treating it as a credential redacted the account being reset — the single most
         # important detail in a sudoers diff. Same for `/usr/local/bin/passwd_sync.sh --dest …`.
-        if m.start(1) > 0 and m.string[m.start(1) - 1] == "/":
+        # …but ONLY when the separator is WHITESPACE. A '/'-preceded key followed by '=' or ':'
+        # is still an ASSIGNMENT, not a path component, and exempting those leaked real
+        # credentials: `//registry.npmjs.org/_authToken=<secret>` (a genuine .npmrc spelling),
+        # `https://host/api_key=<secret>`, `/etc/foo/password=<secret>`. The case this rule exists
+        # for — `NOPASSWD: /usr/bin/passwd backdoor2026` — is whitespace-separated.
+        if (m.start(1) > 0 and m.string[m.start(1) - 1] == "/"
+                and ":" not in sep and "=" not in sep):
             return _show(m, key, sep, val, depth)
         # sudoers TAGS are grants, not secrets — but gate on the EXACT uppercase tag, not a
         # substring: `"nopasswd" in key` also exempted `export NOPASSWD_TOKEN=<secret>`.

