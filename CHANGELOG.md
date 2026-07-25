@@ -39,6 +39,14 @@ behind an architectural blind spot rather than inside any one function:
   either snapshot (snapshots now stamp tool identity, schema 4); and `install.sh` **pins the job's
   `PATH`**, copying the installing shell's resolution order. A transient `brew list` timeout caused
   the identical flood, so the guard — not the `PATH` — is the real fix.
+- **Losing sight of a category is now a ranked finding, not a whisper.** Skipping an unusable
+  category is right (comparing fabricates mass add/remove) — but a passive `note:` would have let
+  an attacker buy *silence* by breaking a collector's tool, since neither the old phantom flood nor
+  a note ever reached the `--notify` threshold. A category that was visible in the baseline and
+  isn't now yields an ORANGE **"LOST VISIBILITY"** finding that ranks under "worth a look" and
+  fires the notification. A first run, a legitimately absent tool, or the one-time pre-v0.4.4
+  stamp transition stays a quiet note — verified in all three directions. (Found by reviewing the
+  capability guard added earlier in this same release.)
 - **`difflib` was quadratic on a planted rc file** (~100 distinct repeated lines defeat its
   autojunk filter): a 0.74 MB `~/.zshrc` cost 32s of a real digest run. `MAX_READ` bounded the
   read; nothing bounded the diff. Above 20k lines / 1 MB the change is reported *with a content
@@ -69,15 +77,6 @@ behind an architectural blind spot rather than inside any one function:
 - Blobs are stored capped at 256 KB plus a hash of the full content: 13 tracked files at the 8 MB
   read cap meant ~109 MB per snapshot and ~9.6 GB across `KEEP_SNAPSHOTS=90` → ~293 MB, with
   changes past the cap still detected.
-
-- **Losing sight of a category is now a ranked finding, not a whisper.** Skipping an unusable
-  category is right (comparing fabricates mass add/remove) — but a passive `note:` would have let
-  an attacker buy *silence* by breaking a collector's tool, since neither the old phantom flood nor
-  a note ever reached the `--notify` threshold. A category that was visible in the baseline and
-  isn't now yields an ORANGE **"LOST VISIBILITY"** finding that ranks under "worth a look" and
-  fires the notification. A first run, a legitimately absent tool, or the one-time pre-v0.4.4
-  stamp transition stays a quiet note — verified in all three directions. (Found by reviewing the
-  capability guard added earlier in this same release.)
 
 **Docs:** `SECURITY.md`'s `PATH` paragraph was **wrong by omission** — it presented the daily job's
 minimal `PATH` purely as a safety property when it was also the cause of the blindness above. It
