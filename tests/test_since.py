@@ -1021,3 +1021,50 @@ def test_v044_no_leak(line, secret):
 ])
 def test_v044_does_not_hide_the_attack(line):
     assert since.redact(line) == line
+
+
+# Losing sight of a category is itself a security event: the capability guard correctly stops
+# the phantom flood, but a passive `note:` would let an attacker buy SILENCE by breaking a
+# collector's tool (neither the flood nor a note ever fired --notify).
+def _cap_snap(brew, errors=None, tools=None):
+    s = snap(collectors={"brew": brew})
+    s["errors"] = errors or {}
+    if tools is not None:
+        s["tools"] = tools
+    else:
+        s.pop("tools", None)
+    return s
+
+
+def test_lost_coverage_is_ranked_and_would_notify():
+    full = _cap_snap({f"pkg{i}": "1" for i in range(50)}, tools={"brew": "/opt/homebrew/bin/brew"})
+    blind = _cap_snap({}, errors={"brew": "not on PATH: brew"}, tools={"brew": ""})
+    unusable = since.unusable_cats(full, blind)
+    lost = since.coverage_lost(full, blind, unusable)
+    assert lost, "a working baseline losing its tool must count as lost coverage"
+    findings = since.build_findings(full, blind, skip_cats=tuple(unusable), coverage=lost)
+    assert not [f for f in findings if f["category"] == "brew"]        # no phantom flood
+    cov = [f for f in findings if f["category"] == "coverage"]
+    assert len(cov) == 1 and cov[0]["level"] == since.ORANGE
+    assert since.max_level(findings) >= since.ORANGE, "must be loud enough to notify"
+    out = since.render(findings, full, blind, [], [])
+    assert "LOST VISIBILITY" in out and "Worth a look" in out
+
+
+def test_benign_tool_stamp_transition_does_not_alarm():
+    # a pre-v0.4.4 baseline has no tool stamp: skip the comparison, but do NOT cry wolf
+    old = _cap_snap({f"pkg{i}": "1" for i in range(50)})
+    new = _cap_snap({f"pkg{i}": "1" for i in range(50)}, tools={"brew": "/opt/homebrew/bin/brew"})
+    unusable = since.unusable_cats(old, new)
+    assert "brew" in unusable                                  # skipped (fail closed)
+    assert since.coverage_lost(old, new, unusable) == {}        # but not an alarm
+    findings = since.build_findings(old, new, skip_cats=tuple(unusable),
+                                    coverage=since.coverage_lost(old, new, unusable))
+    assert not [f for f in findings if f["category"] == "coverage"]
+
+
+def test_tool_absent_in_both_snapshots_is_silent():
+    a = _cap_snap({}, errors={"brew": "not on PATH: brew"}, tools={"brew": ""})
+    b = _cap_snap({}, errors={"brew": "not on PATH: brew"}, tools={"brew": ""})
+    assert since.unusable_cats(a, b) == {}          # nothing to compare either way
+    assert since.coverage_lost(a, b, {}) == {}

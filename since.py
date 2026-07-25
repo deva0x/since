@@ -1504,8 +1504,25 @@ def unusable_cats(baseline: dict, current: dict) -> dict:
     return out
 
 
+def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
+    """{category: reason} for the subset of `unusable` that means we USED to see a category and
+    now cannot. Skipping a category is the right call (comparing fabricates mass add/remove) —
+    but silently skipping it is not: losing visibility is itself a security event, and an
+    attacker who breaks `brew` would otherwise buy silence for their own install. A first run,
+    or a baseline predating tool stamping, is NOT a loss — that's benign and gets a note only."""
+    bt = baseline.get("tools") or {}
+    be = baseline.get("errors", {}) or {}
+    ce = current.get("errors", {}) or {}
+    lost = {}
+    for cat, why in unusable.items():
+        had_it = bool(bt.get(cat)) and cat not in be      # baseline could genuinely see it
+        if had_it and (cat in ce or not (current.get("tools") or {}).get(cat)):
+            lost[cat] = why
+    return lost
+
+
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
-                   skip_priv_blobs=False) -> list[dict]:
+                   skip_priv_blobs=False, coverage: dict | None = None) -> list[dict]:
     rules = load_ignores()
     findings: list[dict] = []
     for key, meta in CAT.items():
@@ -1596,6 +1613,13 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
         findings.append({"category": "config", "label": "System files", "cls": "config",
                          "action": status, "key": key, "value": None, "level": level,
                          "trust": None, "why": why, "undo": None, "diff": udiff})
+    # Losing a whole category is ranked, not whispered — so it reaches "worth a look" and can
+    # fire --notify, instead of an attacker gaining silence by breaking the collector's tool.
+    for cat, why in sorted((coverage or {}).items()):
+        findings.append({"category": "coverage", "label": "Monitoring coverage",
+                         "cls": "config", "action": "changed", "key": CAT[cat]["label"],
+                         "value": None, "level": ORANGE, "trust": None,
+                         "why": f"no longer visible: {why}", "undo": None})
     findings.sort(key=lambda f: (-f["level"], f["category"], f["key"]))
     return findings
 
@@ -1657,6 +1681,8 @@ def _describe(f: dict) -> str:
         if f.get("removed_ports"):
             bits.append("stopped listening on port(s) " + clean(", ".join(f["removed_ports"])))
         return f"listener {paint(key, 'bold')} " + "; ".join(bits)
+    if cat == "coverage":
+        return f"LOST VISIBILITY: {paint(key, 'bold')} is no longer being monitored"
     if cat == "config":
         tag = {"added": "now tracked", "removed": "gone", "changed": "edited"}[action]
         return f"{key} ({tag})"
@@ -1955,9 +1981,12 @@ def cmd_diff(args, notify_on=False):
     # on PATH — the daily job's PATH differs from your shell's — or a timeout) would
     # otherwise report its whole category as removed/added.
     unusable = unusable_cats(baseline, current)
+    lost = coverage_lost(baseline, current, unusable)
     if unusable:
         skip = tuple(unusable)
         for cat, why in sorted(unusable.items()):
+            if cat in lost:
+                continue     # reported as a ranked finding instead of a passive note
             notes.append(f"{CAT[cat]['label']}: comparison skipped — {clean(str(why))[:110]}")
     base_root = baseline.get("root")  # None on unstamped (pre-v0.3) snapshots
     if base_root is None:
@@ -1971,7 +2000,7 @@ def cmd_diff(args, notify_on=False):
                      f"{'root' if current.get('root') else 'user'}) — "
                      "listening/outbound and sudoers/crontab comparison skipped to avoid false alarms.")
 
-    findings = build_findings(baseline, current, include_quiet=args.all,
+    findings = build_findings(baseline, current, coverage=lost, include_quiet=args.all,
                               skip_cats=skip, skip_priv_blobs=skip_priv_blobs)
     big, growing, big_note = find_big_new_files(baseline.get("epoch", current["epoch"]))
     if big_note:
