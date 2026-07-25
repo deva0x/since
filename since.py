@@ -151,7 +151,7 @@ def tilde(p: str) -> str:
     return p
 
 
-MAX_ARGV = 4096              # cap the plist argv string we scan/render
+MAX_ARGV = 64 * 1024         # scanned in full (chunked + literal-prefiltered); see _enrich
 MAX_READ = 8 * 1024 * 1024   # plists/.desktop/manifests/rc files are KBs; 8MB is generous
 DIFF_MAX_LINES = 20_000      # above this, report the change without a quadratic line diff
 DIFF_MAX_BYTES = 1024 * 1024
@@ -339,6 +339,11 @@ _HARD_SECRET_RE = re.compile(
 # show. Deliberately shape-narrow (uppercase tag + colon + command-shaped value) so an
 # assignment (`PASSWD=hunter2`) or a YAML-ish `PASSWD: hunter2` still redacts.
 _SUDO_TAGS = ("PASSWD", "NOPASSWD")
+# Reporting `signature: Apple-signed` for a launch item whose Program is /bin/sh actively
+# reassures the reader about a malicious payload: that signature is the INTERPRETER's, and every
+# interpreter on the box is legitimately signed. Name the interpreter instead.
+_INTERPRETERS = ("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "env",
+                 "perl", "ruby", "osascript", "node", "php", "lua", "tclsh", "expect")
 # A sudoers command spec: `ALL`, an absolute path, or a negated one — optionally followed by
 # more TAGS (`PASSWD:NOEXEC: /tmp/miner`) or a comma list (`ALL, !/usr/bin/su`). The v0.4.3
 # gate tested only `tok == "ALL" or tok[0] in "/!"`, so both ordinary spellings still had the
@@ -753,7 +758,7 @@ def _mac_brew():
         if parts:
             res[parts[0]] = parts[-1] if len(parts) > 1 else ""
     # casks (GUI apps installed via brew) — invisible to `brew list --versions`
-    for line in run(["brew", "list", "--cask", "--versions"], timeout=40).splitlines():
+    for line in run_checked(["brew", "list", "--cask", "--versions"], timeout=40).splitlines():
         parts = line.split()
         if parts:
             res[f"{parts[0]} (cask)"] = parts[-1] if len(parts) > 1 else ""
@@ -1041,17 +1046,20 @@ def _linux_packages():
             # no package manager at all is reachable — say so rather than return {}
             raise ToolUnavailable("no package manager on PATH (dpkg-query/rpm/pacman/snap/flatpak)")
     if cmd:
-        for line in run(cmd, timeout=40).splitlines():
+        # run_checked: unchecked, a dpkg-query/rpm/pacman timeout returned "" with no error
+        # recorded, so the capability guard could not fire and EVERY Linux package read as
+        # removed — the phantom flood, still fully reachable on Linux.
+        for line in run_checked(cmd, timeout=40).splitlines():
             p = line.split()
             if p:
                 res[p[0]] = p[1] if len(p) > 1 else ""
     if _has("snap"):
-        for line in run(["snap", "list"], timeout=15).splitlines()[1:]:
+        for line in run_checked(["snap", "list"], timeout=15).splitlines()[1:]:
             p = line.split()
             if p:
                 res[f"{p[0]} (snap)"] = p[1] if len(p) > 1 else ""
     if _has("flatpak"):
-        for line in run(["flatpak", "list", "--columns=application,version"], timeout=15).splitlines():
+        for line in run_checked(["flatpak", "list", "--columns=application,version"], timeout=15).splitlines():
             p = line.split("\t") if "\t" in line else line.split()
             if p and p[0]:
                 res[f"{p[0].strip()} (flatpak)"] = (p[1].strip() if len(p) > 1 else "")
@@ -1095,13 +1103,14 @@ def backend_for(cat_key: str):
 
 
 # text files whose *contents* we track, so we can show the exact line that changed
-def malicious_hits(text: str) -> set:
+def malicious_hits(text: str) -> dict:
     """Descriptions of every malicious pattern present in `text`, scanned LINE BY LINE with a
     per-line cap. These patterns are line-oriented, and one `search()` over a whole blob (up to
     MAX_READ) was quadratic in the number of trigger tokens on a single line. Bounding the line
     length here AND the patterns' own runs above keeps the scan linear."""
-    hits = set()
+    hits: dict = {}
     for line in text.splitlines():
+        seen = set()
         # CHUNK, don't truncate. `line[:_REDACT_MAX]` meant a payload appended after 4KB of
         # padding ON ONE LINE was never flagged — which re-opened the very hole blob_flags was
         # added to close (past BLOB_MAX the diff text is gone too, so the finding lost RED and
@@ -1114,12 +1123,18 @@ def malicious_hits(text: str) -> set:
                 # length — 8MB of 4096-column `curl ` lines cost 20-56s at SNAPSHOT time. A
                 # `str.find` for the literal the pattern cannot match without is linear and
                 # rejects those lines outright: 20225ms -> 58ms, detection unchanged.
-                if desc in hits or (lit and lit not in window):
+                # COUNT occurrences (per line), don't just record presence: descriptions are
+                # shared between patterns (`curl|sh` and `wget|sh`), so one benign decoy comment
+                # planted in the baseline marked a description present forever and suppressed
+                # every later real payload sharing it. An increased count still escalates.
+                if desc in seen or (lit and lit not in window):
                     continue
                 if pat.search(window):
-                    hits.add(desc)
+                    seen.add(desc)
             if len(window) < _SCAN_CHUNK:
                 break
+        for desc in seen:
+            hits[desc] = hits.get(desc, 0) + 1
     return hits
 
 
@@ -1134,7 +1149,9 @@ def text_sources(flags: dict | None = None) -> dict[str, str]:
             # still detected (the sha covers everything) but it silently fell RED -> ORANGE and
             # lost its "why". Flags are diffed separately, so escalation survives truncation.
             if flags is not None:
-                hits = sorted(malicious_hits(content))
+                # the COUNT per pattern description, not a flattened list: see _flag_counts —
+                # presence alone let a benign decoy in the baseline suppress a real payload.
+                hits = malicious_hits(content)
                 if hits:
                     flags[label] = hits
             if len(content) > BLOB_MAX:
@@ -1190,8 +1207,8 @@ def text_sources(flags: dict | None = None) -> dict[str, str]:
 # system files whose edits are high-severity, and content that screams "malicious"
 SENSITIVE_TEXT = ("/etc/hosts", "/etc/sudoers", "sshd_config", "authorized_keys", "crontab")
 MALICIOUS_PATTERNS = [
-    (re.compile(r"curl[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
-    (re.compile(r"wget[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
+    (re.compile(r"curl[^\n|]{0,400}\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
+    (re.compile(r"wget[^\n|]{0,400}\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
     (re.compile(r"(ba)?sh\s+<\(\s*(curl|wget)", re.I), "runs a download via process substitution"),
     # bounded runs, not `.*`: unbounded, these were quadratic in the number of trigger tokens
     # on one line — a planted line of repeated `base64 -d ` cost 55s at 375KB and hours at
@@ -1625,7 +1642,21 @@ def _is_priv_blob(key: str) -> bool:
 # binary answered matters as much as whether one did: /usr/bin/pip3 and /opt/homebrew/bin/pip3
 # report different package sets, and the daily job resolves a different PATH than your shell.
 # The resolved path is stamped into each snapshot (like euid) and compared before diffing.
-CAT_TOOLS = {"brew": "brew", "npm_global": "npm", "pip": "pip3", "mac_app_store": "mas"}
+def _pkg_tool() -> str:
+    """The binary that actually answers for the `brew` CATEGORY on this platform. On Linux that
+    category is `_linux_packages` (dpkg-query/rpm/pacman), so stamping `brew` there always
+    resolved to "" — which made the whole capability guard a no-op for the most important
+    inventory category: no LOST VISIBILITY when the package manager broke, and recovery could
+    never fire."""
+    if PLATFORM == "macos":
+        return "brew"
+    for t in ("dpkg-query", "rpm", "pacman"):
+        if shutil.which(t):
+            return t
+    return "dpkg-query"
+
+
+CAT_TOOLS = {"brew": _pkg_tool(), "npm_global": "npm", "pip": "pip3", "mac_app_store": "mas"}
 
 
 def _dict(v) -> dict:
@@ -1669,6 +1700,17 @@ def unusable_cats(baseline: dict, current: dict) -> dict:
     return out
 
 
+def _flag_counts(snap: dict, key: str) -> dict:
+    """{pattern description: count} for one blob, tolerating every legacy/wrong shape: v0.4.4
+    stored a list, and a hostile or corrupt snapshot can store anything at all."""
+    v = _dict(snap.get("blob_flags")).get(key)
+    if isinstance(v, dict):
+        return {k: n for k, n in v.items() if isinstance(k, str) and isinstance(n, int)}
+    if isinstance(v, (list, tuple, set)):
+        return {d: 1 for d in v if isinstance(d, str)}
+    return {}
+
+
 def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
     """{category: reason} for the subset of `unusable` that means we USED to see a category and
     now cannot. Skipping a category is the right call (comparing fabricates mass add/remove) —
@@ -1704,7 +1746,7 @@ def cat_usable(cat: str, snap: dict) -> bool:
     return True
 
 
-def recover_baselines(current: dict, unusable) -> dict:
+def recover_baselines(current: dict, unusable, baseline: dict | None = None) -> dict:
     """{category: older_snapshot} for each skipped category we can see NOW — the newest earlier
     snapshot that could see it with the SAME tool.
 
@@ -1713,14 +1755,31 @@ def recover_baselines(current: dict, unusable) -> dict:
     run, ever, while the report says "Nothing changed". Walking back recovers it as soon as the
     collector works again."""
     out = {}
+    cutoff = (baseline or {}).get("epoch")
     for cat in sorted(unusable):
         if not cat_usable(cat, current):
             continue                     # still blind now: nothing to compare against
+        # ONLY durable inventory. "What is installed" survives a week; "what is listening" does
+        # not — recovering an ephemeral category against a days-old snapshot FABRICATED 27
+        # ORANGE add/remove findings and fired the notification, i.e. it re-opened the exact
+        # phantom flood the capability guard exists to prevent.
+        if CAT[cat]["cls"] != "software" or cat in PRIV_SENSITIVE_CATS:
+            continue
         want = _dict(current.get("tools")).get(cat)
         for path in reversed(list_snapshot_paths()):
             older = safe_load(path)
-            if (older and cat_usable(cat, older)
-                    and _dict(older.get("tools")).get(cat) == want):
+            if not older or not cat_usable(cat, older):
+                continue
+            # Never compare across privilege levels — recovery bypassed the euid guard entirely,
+            # including the unstamped case the main guard deliberately fails closed on.
+            if older.get("root") is None or older.get("root") != current.get("root"):
+                continue
+            # …and never reach FORWARD of the baseline: with `--since 8d` (or a checkpoint) the
+            # newest usable snapshot can be newer than the requested baseline, which both hid a
+            # change inside the window and claimed a comparison it had not made.
+            if cutoff is not None and (older.get("epoch") or 0) > cutoff:
+                continue
+            if _dict(older.get("tools")).get(cat) == want:
                 out[cat] = older
                 break
     return out
@@ -1820,10 +1879,18 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
         # when the payload sits past BLOB_MAX or the line diff was skipped for size (see
         # text_sources). Flags are computed over the whole file at snapshot time.
         if why is None:
-            new_flags = [d for d in _dict(current.get("blob_flags")).get(key, [])
-                         if d not in _dict(baseline.get("blob_flags")).get(key, [])]
-            if new_flags:
-                level, why = RED, new_flags[0]
+            # _flag_counts: `_dict()` guarded the outer dict but not the VALUE, so a scalar
+            # there (`{"~/.zshrc": 5}`) raised TypeError out of an unisolated path — no snapshot
+            # saved, same poisoned baseline re-read tomorrow, dead every day. Third instance of
+            # this class in one release; validate the shape of everything a snapshot hands back.
+            cur_f, base_f = _flag_counts(current, key), _flag_counts(baseline, key)
+            # COUNTS, not set membership: flags are pattern descriptions, so one benign
+            # `# … wget https://x/get.sh | sh (do not run)` comment planted in the baseline
+            # marked that description present forever and suppressed every later real payload
+            # sharing it. An increase is what matters.
+            worse = [d for d, n in cur_f.items() if n > base_f.get(d, 0)]
+            if worse:
+                level, why = RED, sorted(worse)[0]
         findings.append({"category": "config", "label": "System files", "cls": "config",
                          "action": status, "key": key, "value": None, "level": level,
                          "trust": None, "why": why, "undo": None, "diff": udiff})
@@ -1847,13 +1914,21 @@ def _enrich(f: dict, current: dict):
         prog, argv = plist_program_and_argv(key)
         if prog:
             label, suspicious = trust_of(prog)
+            base = os.path.basename(prog)
+            if base in _INTERPRETERS or base.startswith("python"):
+                label = (f"runs via {base} — an interpreter, so its signature says nothing "
+                         "about what it executes")
+                suspicious = False
             f["trust"] = label
             if suspicious:
                 f["level"] = RED
-        for pat, desc in MALICIOUS_PATTERNS:
-            if argv and pat.search(argv):
-                f["level"], f["why"] = RED, desc     # beats any signature on the interpreter
-                break
+        if argv:
+            # malicious_hits, not a raw pattern loop: it brings the chunked scan and the
+            # required-literal pre-filter, so the WHOLE argv is scanned cheaply instead of only
+            # its first bytes — padding argv[0] past the old cap evaded the scan entirely.
+            hits = malicious_hits(argv)
+            if hits:
+                f["level"], f["why"] = RED, sorted(hits)[0]
         if action == "changed":
             f["level"] = max(f["level"], ORANGE)
     if action == "added":
@@ -2213,11 +2288,17 @@ def cmd_diff(args, notify_on=False):
     # otherwise report its whole category as removed/added.
     unusable = unusable_cats(baseline, current)
     lost = coverage_lost(baseline, current, unusable)
+    # A skipped category must not simply VANISH: the blind snapshot still becomes tomorrow's
+    # baseline, so without this an install made during the blind window is never reported by any
+    # run, ever — while the report cheerfully says "Nothing changed". Fall back to the newest
+    # EARLIER snapshot that could see the category with the same tool. Computed HERE, before the
+    # notes below, which need to know whether a category was recovered.
+    recovered = recover_baselines(current, unusable, baseline)
     if unusable:
         skip = tuple(unusable)
         for cat, why in sorted(unusable.items()):
-            if cat in lost:
-                continue     # reported as a ranked finding instead of a passive note
+            if cat in lost or cat in recovered:
+                continue     # a ranked finding, or recovered below — either way not a bare skip
             notes.append(f"{CAT[cat]['label']}: comparison skipped — {clean(str(why))[:110]}")
     base_root = baseline.get("root")  # None on unstamped (pre-v0.3) snapshots
     if base_root is None:
@@ -2230,12 +2311,6 @@ def cmd_diff(args, notify_on=False):
                      f"({'root' if base_root else 'user'} vs "
                      f"{'root' if current.get('root') else 'user'}) — "
                      "listening/outbound and sudoers/crontab comparison skipped to avoid false alarms.")
-
-    # A skipped category must not simply VANISH. The blind snapshot still becomes tomorrow's
-    # baseline, so without this an install made during the blind window is never reported by any
-    # run, ever — while the report cheerfully says "Nothing changed". Fall back to the newest
-    # EARLIER snapshot that could see the category with the same tool, and diff that instead.
-    recovered = recover_baselines(current, unusable)
 
     findings = build_findings(baseline, current, coverage=lost, include_quiet=args.all,
                               skip_cats=skip, skip_priv_blobs=skip_priv_blobs)
@@ -2250,7 +2325,6 @@ def cmd_diff(args, notify_on=False):
                      f"against the older snapshot from {clean(str(older.get('created')))[:16]}.")
     if recovered:
         findings.sort(key=lambda f: (-f["level"], f["category"], f["key"]))
-        skip = tuple(c for c in skip if c not in recovered)
 
     if args.json:
         # The baseline/corrupt-snapshot note (e.g. "N unreadable snapshot(s) skipped",
