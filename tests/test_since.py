@@ -1487,7 +1487,11 @@ def _run_cli(tmp_path, args, snaps=None, env=None):
     return p
 
 
-def _snap_obj(created, epoch, root=False, **kw):
+def _snap_obj(created, epoch, root=None, **kw):
+    # default to the RUNNER's privilege level, not False: on a VPS the suite runs as root, and
+    # the recovery privilege gate then (correctly) refused a synthetic root=False baseline —
+    # a real portability bug in this fixture, caught only on the Linux box.
+    root = since.IS_ROOT if root is None else root
     s = {"schema": since.SCHEMA_VERSION, "platform": since.PLATFORM, "created": created,
          "epoch": epoch, "root": root, "euid": 0 if root else 501, "errors": {},
          "tools": since.tool_identity(),      # must match a LIVE snapshot, or recovery refuses
