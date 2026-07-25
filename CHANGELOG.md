@@ -2,6 +2,83 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.4] — 2026-07-25
+
+A security release fixing **16 issues found by reviewing v0.4.3 itself** — each reproduced by
+execution before being fixed, and each pinned by a regression test that was *mutation-tested*
+(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **173**. Most of these sat
+behind an architectural blind spot rather than inside any one function:
+
+- Every previous audit round hardened the **snapshot** boundary; **diff-time enrichment had no
+  isolation and no input validation at all**. Collectors are individually failure-isolated;
+  `_enrich` was not, and `main` catches only `KeyboardInterrupt`.
+- `redact()`'s "show" decisions exempted the **entire rest of the line** (its value group runs to
+  end-of-line), and its `=`/`:` branch redacted unconditionally.
+- Undo hints were quoted for the **shell** but not for the **invoked program's own option parser**.
+
+**CRITICAL — the remediation advice could execute attacker code:**
+- **`osascript` re-parsed the login-item name as its own options.** The name is passed as an argv
+  parameter *and* shell-quoted, but neither stops `osascript` consuming a name that looks like an
+  option: a login item called `-e property zz : (do shell script "…")` became a second `-e` chunk
+  whose property initializer **ran at load** — so "delete this login item" executed the malware
+  author's command while the delete silently no-opped on an empty `argv` (verified with a benign
+  marker file). Every hint whose value can begin with `-` now ends option parsing with `--`.
+
+**HIGH:**
+- **One planted plist no longer kills the daily digest permanently.** A *valid* plist with a
+  non-dict root makes `plutil` emit `["x"]`; `.get` on that raised, and with no isolation the
+  digest died — **saving no snapshot**, so the plist stayed "added" and it failed identically every
+  day. Shapes are now validated, and an enrichment failure degrades **one finding** (which still
+  reports, tagged) instead of the whole run.
+- **The daily job was blind to software changes, and the flood hid real installs.** launchd hands
+  an agent a `PATH` with neither `/opt/homebrew/bin` nor `~/.local/bin`, so `brew`/`npm`/`pip3`
+  silently vanished (`brew` 192 → 0) with **no error recorded**: 212 phantom findings, and a
+  genuine new package was pushed past the 40-line render cap and never displayed. Three-part fix —
+  collectors **declare their tools** (`need()`) so absence is recorded; the diff gained a
+  **capability guard** that skips a category unavailable *or answered by a different binary* in
+  either snapshot (snapshots now stamp tool identity, schema 4); and `install.sh` **pins the job's
+  `PATH`**, copying the installing shell's resolution order. A transient `brew list` timeout caused
+  the identical flood, so the guard — not the `PATH` — is the real fix.
+- **`difflib` was quadratic on a planted rc file** (~100 distinct repeated lines defeat its
+  autojunk filter): a 0.74 MB `~/.zshrc` cost 32s of a real digest run. `MAX_READ` bounded the
+  read; nothing bounded the diff. Above 20k lines / 1 MB the change is reported *with a content
+  hash* instead of a line diff — same finding, same severity, 30.5s → 0.01s.
+- **`redact()` concealed path-valued env hijacks entirely**: `SSH_AUTH_SOCK`, `SSH_ASKPASS`,
+  `SUDO_ASKPASS`, `GIT_ASKPASS`, `PGPASSFILE` — each a known credential-theft technique in a
+  tracked rc file, where the path *is* the finding — rendered as `«redacted»`.
+- **The v0.4.3 sudoers `PASSWD:` carve-out was half-done**: a tag chain (`PASSWD:NOEXEC:`) or a
+  comma list (`PASSWD: ALL, !/usr/bin/su`) still had the granted command list redacted away.
+- **Three cleartext credential leaks** in files the tool diffs: `sshpass -p 'secret'` (the spaced
+  form; the attached form was already masked), `https://<token>@github.com/` in `.gitconfig`, and
+  `MYSQL_PWD=` (the `PWD` spelling was not a keyword).
+
+**MEDIUM / LOW:**
+- A planted FIFO `.app` made `codesign` block for its full 10s timeout *per item*; trust checks are
+  now shape-gated (12 planted FIFOs: 120s → 0.00s).
+- The three state-dir reads still using raw `read_text` (`safe_load`, `load_labels`,
+  `load_ignores`) hung forever on a FIFO planted in `~/.local/state/since`.
+- A "show" decision no longer exempts later secrets on the same line (`AuthorizedKeysCommand
+  /usr/bin/fk --api-key=…` printed the key), and the `NOPASSWD` carve-out is gated on the exact
+  uppercase tag — `export NOPASSWD_TOKEN=…` leaked through the old substring test.
+- `PasswordAuthentication=yes` / `AuthorizedKeysFile=/tmp/evil/keys` — the valid `Key=value`
+  spelling — are shown again instead of redacted.
+- Every cask's undo hint named a nonexistent formula (`brew uninstall 'foo (cask)'`) → now
+  `brew uninstall --cask foo`. `/Library/LaunchAgents` gets `sudo rm` (that directory is
+  root-owned, so the unprivileged `rm` could never succeed). A wrong-type collector value in a
+  baseline no longer crashes the diff.
+- Blobs are stored capped at 256 KB plus a hash of the full content: 13 tracked files at the 8 MB
+  read cap meant ~109 MB per snapshot and ~9.6 GB across `KEEP_SNAPSHOTS=90` → ~293 MB, with
+  changes past the cap still detected.
+
+**Docs:** `SECURITY.md`'s `PATH` paragraph was **wrong by omission** — it presented the daily job's
+minimal `PATH` purely as a safety property when it was also the cause of the blindness above. It
+now states the trade plainly: the pinned `PATH` includes user-writable directories, and `since`
+does not attest to the integrity of the tools it asks.
+
+**First run after upgrading:** snapshots taken before this version carry no tool-identity stamp, so
+`brew`/`npm`/`pip` comparisons are skipped **once**, with a note, until a new baseline exists — the
+same fail-closed transition the privilege stamp used.
+
 ## [0.4.3] — 2026-07-25
 
 Fixes for a **third** independent (Kimi) adversarial audit, which re-verified every v0.4.2

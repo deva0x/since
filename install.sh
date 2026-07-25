@@ -61,6 +61,30 @@ esac
 read -r -p "Install daily digest job (09:00 each day, notifies if worth a look)? [y/N] " ans
 if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
   PY="$(command -v python3)"
+  # The job's PATH is NOT your shell's: launchd hands agents a default PATH with no
+  # /opt/homebrew/bin and no ~/.local/bin, and a systemd --user unit gets a minimal one
+  # too. `since` shells out to brew/npm/pip3/mas, so unpinned those collectors silently
+  # returned nothing — the digest reported every package as REMOVED (a flood that also
+  # pushes a genuine new install past the render cap). Pin the dirs where those tools
+  # actually live, resolved from the environment doing the install.
+  # Built from the INSTALLING SHELL's PATH, in its order, then the standard dirs. Order
+  # matters as much as membership: prepending /opt/homebrew ahead of ~/.local/bin made the
+  # job resolve a different `npm` than the shell (5 packages vs 1) — a permanent phantom
+  # diff. Only absolute entries are kept, so a relative '.' on PATH can't ride along.
+  # NOTE: IFS splitting, not ${PATH//:/...} — macOS ships bash 3.2, where the ANSI-C
+  # replacement form silently produces nothing and this would quietly rebuild the very
+  # blindness it exists to prevent.
+  JOB_PATH=""
+  _add_dir() {
+    case ":${JOB_PATH}:" in *":$1:"*) return;; esac
+    [ -d "$1" ] || return
+    case "$1" in /*) JOB_PATH="${JOB_PATH:+${JOB_PATH}:}$1";; esac
+  }
+  _old_ifs="$IFS"; IFS=":"
+  for d in $PATH; do _add_dir "$d"; done
+  IFS="$_old_ifs"
+  for d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do _add_dir "$d"; done
+  echo "  daily job PATH: ${JOB_PATH}"
   if [[ "$OS" == "Darwin" ]]; then
     mkdir -p "${HOME}/Library/LaunchAgents"
     cat > "${PLIST}" <<EOF
@@ -76,6 +100,8 @@ if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
     <string>digest</string>
     <string>--notify</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>${JOB_PATH}</string></dict>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><false/>
@@ -96,6 +122,7 @@ Description=since — daily change digest
 
 [Service]
 Type=oneshot
+Environment=PATH=${JOB_PATH}
 ExecStart="${PY}" "${REPO_DIR}/since.py" digest --notify
 EOF
     cat > "${SYSTEMD_DIR}/since.timer" <<EOF

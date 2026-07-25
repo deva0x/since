@@ -255,12 +255,12 @@ def test_priv_blob_covers_all_cron():
 
 def test_linux_undo_hints(monkeypatch):
     monkeypatch.setattr(since, "PLATFORM", "linux")
-    assert since.undo_hint("launch_items", "nginx.service", None) == "sudo systemctl disable --now nginx.service"
-    assert since.undo_hint("launch_items", "user:foo.service", None) == "systemctl --user disable --now foo.service"
+    assert since.undo_hint("launch_items", "nginx.service", None) == "sudo systemctl disable --now -- nginx.service"
+    assert since.undo_hint("launch_items", "user:foo.service", None) == "systemctl --user disable --now -- foo.service"
     assert since.undo_hint("kernel_extensions", "evil_rk", None).startswith("sudo modprobe -r evil_rk")
-    assert since.undo_hint("brew", "nginx", None).startswith("sudo apt remove nginx")
-    assert since.undo_hint("brew", "code (snap)", None) == "sudo snap remove code"
-    assert since.undo_hint("login_items", "x.desktop", None).startswith("rm ")
+    assert since.undo_hint("brew", "nginx", None).startswith("sudo apt remove -- nginx")
+    assert since.undo_hint("brew", "code (snap)", None) == "sudo snap remove -- code"
+    assert since.undo_hint("login_items", "x.desktop", None).startswith("rm -- ")
     # attacker-chosen names are still shlex-quoted on Linux
     assert shlex.quote("a; rm -rf ~") in since.undo_hint("brew", "a; rm -rf ~", None)
 
@@ -661,9 +661,9 @@ def test_autostart_undo_hint_targets_the_right_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(since, "PLATFORM", "linux")
     monkeypatch.setattr(since, "HOME", tmp_path)
     assert since.undo_hint("login_items", "x.desktop", None) == \
-        f"rm {shlex.quote(str(tmp_path / '.config/autostart/x.desktop'))}"
+        f"rm -- {shlex.quote(str(tmp_path / '.config/autostart/x.desktop'))}"
     assert since.undo_hint("login_items", "x.desktop (system)", None) == \
-        "sudo rm /etc/xdg/autostart/x.desktop"
+        "sudo rm -- /etc/xdg/autostart/x.desktop"
 
 
 # v3 #6 (Low) — the ' (~/Applications)' disambiguator is not part of the app's PATH; with
@@ -804,3 +804,220 @@ def test_history_is_bounded_and_recent(monkeypatch, tmp_path):
     hist = since.load_history()
     assert hist and hist[-1] == "brew install pkg4999"        # newest kept
     assert "brew install pkg0" not in hist                    # oldest dropped by the cap
+
+
+# =========================================================================== #
+# v0.4.4 — self-review findings (mutation-tested; see PENDING.md for repros).   #
+# =========================================================================== #
+
+# U1 (CRITICAL) — shell-quoting stops the SHELL, not the invoked program's option parser.
+# `osascript` re-parsed the quoted login-item name as its own -e chunk and RAN it.
+def test_login_item_hint_ends_option_parsing(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    evil = '-e property zz : (do shell script "touch /tmp/pwned")'
+    hint = since.undo_hint("login_items", evil, None)
+    assert "end run' -- " in hint, "no end-of-options guard: osascript will execute the name"
+    assert hint.index(" -- ") > hint.index("end run"), "the -- must come after the script chunks"
+    assert shlex.quote(evil) in hint          # still shell-safe too
+
+
+@pytest.mark.parametrize("cat,key", [("npm_global", "-g"), ("pip", "--upgrade"),
+                                     ("login_items", "-e evil")])
+def test_hints_guard_leading_dash_values(monkeypatch, cat, key):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    hint = since.undo_hint(cat, key, None)
+    assert " -- " in hint, f"{cat} hint would pass {key!r} to the program as an OPTION"
+
+
+def test_linux_hints_guard_leading_dash(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "PLATFORM", "linux")
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    for cat, key in [("launch_items", "-evil.service"), ("brew", "-evil"),
+                     ("brew", "-evil (snap)"), ("login_items", "-evil.desktop")]:
+        assert " -- " in since.undo_hint(cat, key, None), (cat, key)
+
+
+# U2 — a cask key carries a ' (cask)' tag, so the emitted formula name did not exist.
+def test_cask_undo_hint_names_a_real_formula(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    assert since.undo_hint("brew", "google-chrome (cask)", None) == \
+        "brew uninstall --cask google-chrome"
+    assert since.undo_hint("brew", "wget", None) == "brew uninstall wget"
+
+
+# U3 — /Library/LaunchAgents is root-owned, so the unprivileged rm silently failed.
+def test_library_launchagents_hint_uses_sudo(monkeypatch):
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    for d in ("/Library/LaunchAgents", "/Library/LaunchDaemons"):
+        hint = since.undo_hint("launch_items", f"{d}/com.evil.plist", None)
+        assert "sudo rm" in hint, d
+    # a user-owned agent still needs no sudo
+    assert "sudo" not in since.undo_hint(
+        "launch_items", "~/Library/LaunchAgents/com.mine.plist", None)
+
+
+# F1 (HIGH) — a *valid* plist with a non-dict root made plutil emit `["x"]`; `.get` on that
+# raised, and because nothing isolates diff-time enrichment the whole digest died — saving no
+# snapshot, so it recurred every day.
+@pytest.mark.parametrize("body,label", [
+    ("<array><string>hi</string></array>", "array root"),
+    ("<dict><key>ProgramArguments</key><array><array><string>x</string></array></array></dict>",
+     "nested ProgramArguments"),
+    ("<dict><key>ProgramArguments</key><array><dict/></array></dict>", "dict in ProgramArguments"),
+    ("<string>just a string</string>", "string root"),
+])
+def test_malformed_plist_does_not_crash(tmp_path, body, label):
+    p = tmp_path / "com.evil.plist"
+    p.write_text(f'<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0">{body}</plist>')
+    assert since.program_of_plist(str(p)) is None, label     # no exception, no bogus path
+
+
+def test_trust_of_rejects_non_string_and_non_regular(tmp_path):
+    for bad in ([1, 2], {"a": 1}, None, ""):
+        assert since.trust_of(bad) == (None, False)
+    fifo = tmp_path / "Evil.app"
+    os.mkfifo(fifo)
+    with deadline():                       # would block for codesign's full 10s timeout
+        assert since.trust_of(str(fifo)) == (None, False)
+
+
+def test_enrich_failure_degrades_one_finding_not_the_report(monkeypatch):
+    # program_of_plist, not trust_of: trust_of is only reached when a program was resolved,
+    # so patching it would have exercised nothing (the first version of this test did).
+    monkeypatch.setattr(since, "program_of_plist",
+                        lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
+    b = snap()
+    c = snap(collectors={"launch_items": {"~/Library/LaunchAgents/x.plist": "1:a"}})
+    findings = since.build_findings(b, c)   # must not raise
+    f = next(x for x in findings if x["category"] == "launch_items")
+    assert "enrichment failed" in (f["trust"] or ""), f
+    assert f["level"] >= since.ORANGE, "the finding itself must still be reported"
+
+
+# F6 — a wrong-type collector value in a baseline crashed the diff (safe_load only checks
+# that `collectors` is a dict, not its values).
+def test_wrong_type_collector_value_does_not_crash():
+    b = snap()
+    b["collectors"]["brew"] = ["not", "a", "dict"]
+    c = snap(collectors={"login_items": {"a": "a"}})
+    findings = since.build_findings(b, c)          # must not raise
+    assert any(f["category"] == "login_items" for f in findings)
+
+
+# F2 (HIGH) — difflib is quadratic on ~100 distinct repeated lines; MAX_READ bounded the READ
+# but nothing bounded the DIFF (a planted 0.74MB rc file cost 32s of a real digest).
+def test_huge_blob_diff_is_bounded_and_still_reported():
+    a = "".join(f"line{i % 100}\n" for i in range(200_000))
+    b_ = "".join(f"line{(i + 1) % 100}\n" for i in range(200_000))
+    base, cur = snap(blobs={"~/.zshrc": a}), snap(blobs={"~/.zshrc": b_})
+    t = time.time()
+    findings = since.build_findings(base, cur)
+    assert time.time() - t < 3.0, "quadratic diff is unbounded again"
+    cf = [f for f in findings if f["category"] == "config"]
+    assert cf and cf[0]["level"] >= since.ORANGE       # still reported, at the same severity
+    assert "too large to diff" in cf[0]["diff"][0]
+
+
+# F4 — the three state-dir reads that still blocked on a planted FIFO.
+def test_state_dir_reads_never_block(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(since, "LABELS_FILE", tmp_path / "labels.json")
+    monkeypatch.setattr(since, "IGNORE_FILE", tmp_path / "ignore.txt")
+    (tmp_path / "snapshots").mkdir()
+    os.mkfifo(tmp_path / "snapshots" / "a.json")
+    os.mkfifo(tmp_path / "labels.json")
+    os.mkfifo(tmp_path / "ignore.txt")
+    with deadline():
+        assert since.safe_load(tmp_path / "snapshots" / "a.json") is None
+        assert since.load_labels() == {}
+        assert since.load_ignores() == []
+
+
+# The capability guard: a collector that could not run in ONE snapshot must not have its whole
+# category reported as removed — that flood also pushed a REAL new install past the render cap.
+def test_capability_guard_suppresses_phantom_removals():
+    full = snap(collectors={"brew": {f"pkg{i}": "1" for i in range(50)}})
+    full["tools"] = {"brew": "/opt/homebrew/bin/brew"}
+    blind = snap(collectors={"brew": {}})
+    blind["errors"] = {"brew": "not on PATH: brew"}
+    blind["tools"] = {"brew": ""}
+    assert since.unusable_cats(full, blind) == {"brew": "not on PATH: brew"}
+    kept = since.build_findings(full, blind, skip_cats=tuple(since.unusable_cats(full, blind)))
+    assert not [f for f in kept if f["category"] == "brew"], "phantom removals not suppressed"
+    # control: without the guard they DO flood
+    assert len([f for f in since.build_findings(full, blind) if f["category"] == "brew"]) == 50
+
+
+def test_capability_guard_catches_a_different_tool_answering():
+    a, b = snap(collectors={"pip": {"x": "1"}}), snap(collectors={"pip": {"y": "2"}})
+    a["tools"] = {"pip": "/opt/homebrew/bin/pip3"}
+    b["tools"] = {"pip": "/usr/bin/pip3"}          # same tool NAME, different binary
+    assert "pip" in since.unusable_cats(a, b)
+    a["tools"] = b["tools"] = {"pip": "/usr/bin/pip3"}
+    assert "pip" not in since.unusable_cats(a, b)
+    # fail CLOSED when a snapshot predates tool stamping
+    c = snap(collectors={"pip": {"x": "1"}})
+    c.pop("tools", None)
+    assert "pip" in since.unusable_cats(c, b)
+
+
+def test_tool_identity_is_stamped_in_snapshots():
+    t = since.tool_identity()
+    assert set(t) == set(since.CAT_TOOLS)
+    assert all(isinstance(v, str) for v in t.values())
+
+
+def test_need_raises_for_a_missing_tool():
+    with pytest.raises(since.ToolUnavailable):
+        since.need("definitely-not-a-real-binary-xyz")
+    since.need("sh")          # present: must not raise
+
+
+# F5 — blobs are stored verbatim in every snapshot; 13 files at the 8MB read cap meant ~9.6GB
+# across KEEP_SNAPSHOTS. Capped, but a change past the cap must still be detected.
+def test_blob_storage_is_capped_but_change_still_detected(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    big = "x" * (since.BLOB_MAX * 2)
+    (tmp_path / ".zshrc").write_text(big)
+    first = since.text_sources()["~/.zshrc"]
+    assert len(first) < since.BLOB_MAX + 200
+    (tmp_path / ".zshrc").write_text(big[:-1] + "EVIL")     # change PAST the cap
+    assert since.text_sources()["~/.zshrc"] != first
+
+
+# Redaction: leaks that survived v0.4.3, and attacks v0.4.3 concealed. Both directions.
+@pytest.mark.parametrize("line,secret", [
+    ("+*/5 * * * * sshpass -p 'Tr0ub4dor&3' ssh a@h /x.sh", "Tr0ub4dor&3"),
+    ("+mysqldump -uroot -pTr0ub4dor3 db", "Tr0ub4dor3"),
+    ('+[url "https://aB3xYz9Qw2mN7pL1kJ4h@github.com/"]', "aB3xYz9Qw2mN7pL1kJ4h"),
+    ("+export MYSQL_PWD=Tr0ub4dor3", "Tr0ub4dor3"),
+    ('+oauth2-bearer = "aB3xYz9Qw2mN7pL1kJ4h"', "aB3xYz9Qw2mN7pL1kJ4h"),
+    ('+header = "X-Auth: aB3xYz9Qw2mN7pL1kJ4h"', "aB3xYz9Qw2mN7pL1kJ4h"),
+    ("+AuthorizedKeysCommand /usr/bin/fk --api-key=aB3xYz9Qw2mN7pL1", "aB3xYz9Qw2mN7pL1"),
+    ("+export NOPASSWD_TOKEN=aB3xYz9Qw2mN7pL1kJ4h", "aB3xYz9Qw2mN7pL1kJ4h"),
+    ("+deva ALL=(ALL) NOPASSWD: /usr/bin/sshpass -p Tr0ub4dor3 ssh root@x", "Tr0ub4dor3"),
+    ("+export SSH_ASKPASS=hunter2Mixed", "hunter2Mixed"),   # non-path value under a path key
+])
+def test_v044_no_leak(line, secret):
+    assert secret not in since.redact(line)
+
+
+@pytest.mark.parametrize("line", [
+    "+export SSH_AUTH_SOCK=/tmp/.evil/agent.sock",
+    "+export SSH_ASKPASS=/tmp/steal.sh",
+    "+export SUDO_ASKPASS=/tmp/steal.sh",
+    "+export GIT_ASKPASS=/tmp/steal.sh",
+    "+export PGPASSFILE=/tmp/evil.pgpass",
+    "+export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/gcr/ssh",
+    "+deva ALL=(ALL) PASSWD:NOEXEC: /tmp/miner",
+    "+deva ALL=(ALL) PASSWD:SETENV: ALL",
+    "+deva ALL=(ALL) PASSWD: ALL, !/usr/bin/su",
+    "+PasswordAuthentication=yes",
+    "+AuthorizedKeysFile=/tmp/evil/keys",
+    "+ssh -p 2222 user@host",
+    "+mkdir -p /tmp/x",
+])
+def test_v044_does_not_hide_the_attack(line):
+    assert since.redact(line) == line

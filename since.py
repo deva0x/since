@@ -50,6 +50,7 @@ import os
 import platform as platform_module   # hostname without Unix-only os.uname()
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -58,8 +59,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.3"
-SCHEMA_VERSION = 3
+__version__ = "0.4.4"
+SCHEMA_VERSION = 4   # 4 adds snap['tools'] (collector tool identity)
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
     sys.exit("since requires Python 3.9 or newer")
@@ -151,6 +152,12 @@ def tilde(p: str) -> str:
 
 
 MAX_READ = 8 * 1024 * 1024   # plists/.desktop/manifests/rc files are KBs; 8MB is generous
+DIFF_MAX_LINES = 20_000      # above this, report the change without a quadratic line diff
+DIFF_MAX_BYTES = 1024 * 1024
+# Per-blob storage cap. Blobs are stored VERBATIM in every snapshot, so 13 tracked rc files
+# at the 8MB read cap meant ~109MB per snapshot and ~9.6GB across KEEP_SNAPSHOTS=90. Keep a
+# head plus a hash of the WHOLE content, so a change past the cap is still detected.
+BLOB_MAX = 256 * 1024
 
 def safe_read_bytes(path, limit: int | None = None, tail: bool = False):
     """Read at most `limit` bytes from a REGULAR file, else None. The ONLY way a collector
@@ -269,8 +276,9 @@ _PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
 # The keyword alternation is a SHARED constant, interpolated into both the matcher and the
 # cheap pre-filter below, so the two can NEVER drift apart — a keyword present in one but
 # not the other would silently stop redacting that key (a leak by omission).
-_SECRET_KW = (r"secret|pass(?:wd|word|phrase)?|token|api[_-]?key|access[_-]?key|"
-              r"client[_-]?secret|private[_-]?key|authoriz|_auth|credential")
+_SECRET_KW = (r"secret|pass(?:wd|word|phrase)?|[_-]pwd|token|api[_-]?key|access[_-]?key|"
+              r"client[_-]?secret|private[_-]?key|authoriz|[_-]auth|credential|"
+              r"oauth2?[_-]?bearer")
 _KV_RE = re.compile(r"(?i)([\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
                     r"(\s*[:=]\s*|\s+)(\S.*)$")
 # Linear, backtrack-free pre-filter. _KV_RE can only match if one of these keywords is
@@ -280,6 +288,10 @@ _KV_RE = re.compile(r"(?i)([\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
 _KV_KW_RE = re.compile("(?i)" + _SECRET_KW)
 _SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})")  # auth headers
 _URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
+# `https://<token>@github.com/...` — the standard way to embed a GitHub/GitLab PAT, and
+# `.gitconfig` is tracked. No colon, so _URLAUTH_RE never saw it. Length+entropy gated so
+# `ssh://averylongusername@host` stays readable.
+_URLTOKEN_RE = re.compile(r"://([^/\s:@]{12,})@")
 # curl .curlrc credentials: `user = "name:password"`, `-u name:password`,
 # `--proxy-user u:p`. The password is the part after the first colon in the user field —
 # NOT a `://…@` URL, so _URLAUTH_RE misses it. Keep the username for context, mask the pass.
@@ -290,6 +302,13 @@ _USERPASS_RE = re.compile(
 _TOKEN_RE = re.compile(                                                     # standalone tokens
     r"\bAKIA[0-9A-Z]{16}\b|\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|"
     r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b|\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+# Credentials passed as a command-line FLAG, where the secret is the NEXT token rather than
+# a `key=value`: `sshpass -p hunter2`, `mysql -pSECRET`. The attached form was already caught
+# (the key name absorbed it) but the documented spaced form printed verbatim in a crontab.
+# Anchored, bounded, no nested quantifier — linear.
+_CMDPASS_RE = re.compile(
+    r"(?i)(\b(?:sshpass\s+-p|sshpass\s+--password[= ]|--password[= ]|--token[= ]|"
+    r"mysql(?:dump|admin)?\s+(?:-\w+\s+){0,4}-p)\s*)(\S+)")
 _B64LINE_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")                     # PEM body / raw key
 _KW_VALUES = {"yes", "no", "true", "false", "none", "null", "required",
               "optional", "default", "auto", "inherit", "prohibit-password"}
@@ -300,13 +319,28 @@ _KW_VALUES = {"yes", "no", "true", "false", "none", "null", "required",
 # credential. It does NOT collide with the SOFT `Authorized*` sshd directives: they
 # diverge at index 8 (`authoriza…` vs `authorize…`), so `AuthorizedKeysFile` stays visible.
 _HARD_SECRET_RE = re.compile(
-    r"(?i)(secret|pass(?:wd|word|phrase)?|sshpass|token|api[_-]?key|access[_-]?key|"
-    r"client[_-]?secret|private[_-]?key|credential|_auth|authorization)")   # `_auth` = npm .npmrc basic-auth field
+    r"(?i)(secret|pass(?:wd|word|phrase)?|[_-]pwd|sshpass|token|api[_-]?key|access[_-]?key|"
+    r"client[_-]?secret|private[_-]?key|credential|[_-]auth|authorization|"
+    r"oauth2?[_-]?bearer)")   # `_auth` = npm .npmrc basic-auth field; `_pwd` = MYSQL_PWD
 # sudoers TAGS are grants, not secrets: `PASSWD:`/`NOPASSWD:` prefix a COMMAND list
 # (`PASSWD: /tmp/miner`, `PASSWD: ALL`) — redacting it hides the very attack we exist to
 # show. Deliberately shape-narrow (uppercase tag + colon + command-shaped value) so an
 # assignment (`PASSWD=hunter2`) or a YAML-ish `PASSWD: hunter2` still redacts.
 _SUDO_TAGS = ("PASSWD", "NOPASSWD")
+# A sudoers command spec: `ALL`, an absolute path, or a negated one — optionally followed by
+# more TAGS (`PASSWD:NOEXEC: /tmp/miner`) or a comma list (`ALL, !/usr/bin/su`). The v0.4.3
+# gate tested only `tok == "ALL" or tok[0] in "/!"`, so both ordinary spellings still had the
+# granted command list redacted away — the single most important thing in a sudoers diff.
+_SUDO_CMD_RE = re.compile(r"^(?:ALL\b|[/!])")
+_SUDO_TAG_RE = re.compile(r"^(?:NO)?(?:PASSWD|EXEC|SETENV|LOG_INPUT|LOG_OUTPUT|"
+                          r"MAIL|FOLLOW|INTERCEPT):", re.I)
+# Keys whose VALUE is a FILESYSTEM PATH even though the key names a credential: every one is
+# a known credential-theft / agent-hijack technique when planted in a tracked rc file
+# (SSH_ASKPASS=/tmp/steal.sh, SSH_AUTH_SOCK=/tmp/.evil/agent.sock, PGPASSFILE=…), and the
+# path IS the finding. The unconditional `=`/`:` redaction concealed them completely.
+_PATH_VALUED_KEY_RE = re.compile(
+    r"(?i)(askpass|passfile|pass_file|keysfile|keyscommand|[_-]sock$|_socket$|"
+    r"[_-]file$|[_-]dir$|[_-]path$)")
 _REDACT_MAX = 4096
 
 def _char_classes(tok: str) -> int:
@@ -341,17 +375,30 @@ def redact(line: str) -> str:
     line = _SCHEME_RE.sub(
         lambda m: f"{m.group(1)} «redacted»" if _char_classes(m.group(2)) >= 2 else m.group(0), line)
     line = _URLAUTH_RE.sub(r"://\1:«redacted»@", line)
+    line = _URLTOKEN_RE.sub(
+        lambda m: "://«redacted»@" if _char_classes(m.group(1)) >= 2 else m.group(0), line)
+    line = _CMDPASS_RE.sub(lambda m: f"{m.group(1)}«redacted»", line)
     line = _USERPASS_RE.sub(r"\1«redacted»", line)
     line = _TOKEN_RE.sub("«redacted»", line)
+
+    def _show(m, key, sep, val):
+        """A SHOW decision must expose only THIS key's value, not the whole rest of the line:
+        `_KV_RE`'s value group runs to end-of-line, so returning it verbatim also exempted any
+        later secret on the same line (`AuthorizedKeysCommand /usr/bin/fk --api-key=<secret>`,
+        `NOPASSWD: /usr/bin/sshpass -p <secret>`). Re-scan the tail; each nested pass consumes
+        at least its own key, so this terminates."""
+        inner = _KV_RE.sub(_kv, val) if _KV_KW_RE.search(val) else val
+        inner = _CMDPASS_RE.sub(lambda mm: f"{mm.group(1)}«redacted»", inner)
+        return f"{key}{sep}{inner}"
 
     def _kv(m):
         key, sep, val = m.group(1), m.group(2), m.group(3)
         tok = val.split()[0] if val.split() else ""
-        if "nopasswd" in key.lower():      # sudoers 'NOPASSWD: ALL' is NOT a secret
-            return m.group(0)
-        # sudoers `PASSWD: <command list>` — same carve-out, value-shape gated (_SUDO_TAGS)
-        if key in _SUDO_TAGS and ":" in sep and (tok.upper() == "ALL" or tok[:1] in "/!"):
-            return m.group(0)
+        # sudoers TAGS are grants, not secrets — but gate on the EXACT uppercase tag, not a
+        # substring: `"nopasswd" in key` also exempted `export NOPASSWD_TOKEN=<secret>`.
+        if key in _SUDO_TAGS and ":" in sep and (_SUDO_CMD_RE.match(tok)
+                                                 or _SUDO_TAG_RE.match(tok)):
+            return _show(m, key, sep, val)
         if _HARD_SECRET_RE.search(key):
             # The key literally NAMES a credential, so the value IS the secret.
             # An assignment (`password=…`, `_auth:…`, `SSHPASS=…`) redacts UNCONDITIONALLY:
@@ -361,16 +408,26 @@ def redact(line: str) -> str:
             # `PASS_MAX_DAYS 99999`) — show short/keyword/single-class values, redact only
             # a credential-shaped one (`password hunter2mixed`).
             if (":" in sep) or ("=" in sep):
+                # …with two exceptions, both of which are ATTACKS whose value is the whole
+                # point: a config keyword (`PasswordAuthentication=yes` — the valid `Key=value`
+                # spelling of a directive we already show in its whitespace form), and a
+                # path under a path-valued key (`SSH_ASKPASS=/tmp/steal.sh`). Anything else
+                # stays unconditionally masked: a real token can begin with '/' or '$'.
+                if len(val.split()) == 1 and (
+                        tok.lower() in _KW_VALUES
+                        or (_PATH_VALUED_KEY_RE.search(key) and _is_directive_value(tok))):
+                    return m.group(0)   # single-token value: nothing follows to re-scan
                 return f"{key}{sep}«redacted»"
             if _is_directive_value(tok) or len(tok) < 6 or _char_classes(tok) < 2:
-                return m.group(0)
+                return _show(m, key, sep, val)
             return f"{key}{sep}«redacted»"
-        # SOFT: the key only CONTAINS a directive name (`AuthorizedKeysFile`,
+        # SOFT (falls through to _show, which re-scans the tail — see L5):
+        # the key only CONTAINS a directive name (`AuthorizedKeysFile`,
         # `AuthorizedKeysCommandUser`, `Authorization`). Its value is a path (absolute OR
         # relative like `.ssh/authorized_keys`), a username, or a keyword — real token
         # shapes were already masked by the regexes above. SHOW it, so a malicious
         # AuthorizedKeys* change stays visible (the whole point of #2).
-        return m.group(0)
+        return _show(m, key, sep, val)
     return _KV_RE.sub(_kv, line) if _KV_KW_RE.search(line) else line
 
 
@@ -380,7 +437,16 @@ def redact(line: str) -> str:
 
 def trust_of(path: str):
     """Return (label, suspicious) for a binary/app path. Best-effort, macOS."""
-    if PLATFORM != "macos" or not path or not os.path.exists(path):
+    # isinstance: `path` comes from an attacker-writable plist via program_of_plist, so a
+    # list/dict here made os.path.exists raise TypeError (which is NOT an OSError) and
+    # killed the whole run — diff-time code gets no failure isolation.
+    if PLATFORM != "macos" or not isinstance(path, str) or not path:
+        return (None, False)
+    # a non-regular target (FIFO/device planted as `Evil.app`) makes `codesign` block for
+    # its full 10s timeout; N planted files cost N x 10s of the daily job for nothing.
+    if not (is_regular(path) or os.path.isdir(path)):
+        return (None, False)
+    if not os.path.exists(path):
         return (None, False)
     info = run(["codesign", "-dv", "--verbose=2", path], merge=True, timeout=10)
     low = info.lower()
@@ -407,10 +473,16 @@ def program_of_plist(plist_path: str):
         d = json.loads(out)
     except Exception:
         return None
+    # A *valid* plist can have a non-dict root (`<array>`), so plutil emits `["x"]` and the
+    # old `d.get(...)` raised AttributeError. That crash was fatal AND self-perpetuating:
+    # the snapshot is saved only after build_findings, so the plist stayed "added" and the
+    # daily digest died identically every day. Validate the shape of every value used.
+    if not isinstance(d, dict):
+        return None
     if isinstance(d.get("Program"), str):
         return d["Program"]
     args = d.get("ProgramArguments")
-    if isinstance(args, list) and args:
+    if isinstance(args, list) and args and isinstance(args[0], str):
         return args[0]
     return None
 
@@ -499,6 +571,7 @@ def _mac_launch_items():
 
 
 def _mac_kexts():
+    need("kextstat")
     out = run(["kextstat", "-l"], timeout=10)
     res = {}
     for line in out.splitlines():
@@ -597,6 +670,7 @@ def _mac_net_config():
 
 
 def _mac_brew():
+    need("brew")
     res = {}
     for line in run(["brew", "list", "--versions"], timeout=40).splitlines():
         parts = line.split()
@@ -611,6 +685,7 @@ def _mac_brew():
 
 
 def _npm_global():
+    need("npm")
     out = run(["npm", "ls", "-g", "--depth=0", "--json"], timeout=25)
     if not out.strip():
         return {}
@@ -622,6 +697,11 @@ def _npm_global():
 
 
 def _pip():
+    # NOTE: which pip3 is first on PATH decides WHICH interpreter's packages we see
+    # (system vs Homebrew python), so a daily job and a shell run can legitimately
+    # disagree. need() at least turns "pip3 absent" into a guarded skip rather than
+    # "every package removed"; install.sh pins the job's PATH so both agree.
+    need("pip3")
     out = run(["pip3", "list", "--format=freeze"], timeout=25)
     res = {}
     for line in out.splitlines():
@@ -647,6 +727,7 @@ def _mac_applications():
 
 
 def _mac_mas():
+    need("mas")
     out = run(["mas", "list"], timeout=15)
     res = {}
     for line in out.splitlines():
@@ -660,6 +741,25 @@ def _mac_mas():
 # Linux backends — feed the SAME common schema as the macOS ones. Verified on a
 # real Linux box; collectors return {} where a concept has no Linux equivalent.
 # ---------------------------------------------------------------------------
+
+class ToolUnavailable(Exception):
+    """A collector's external tool isn't on PATH. Raised (not swallowed) so the per-collector
+    failure isolation records it in snap["errors"], which is what lets the diff SKIP the
+    category instead of reporting every item in it as removed."""
+
+
+def need(*tools):
+    """Assert the tools a collector depends on are actually resolvable.
+
+    `run()` returns "" for a missing binary exactly as it does for "no output", so a
+    collector silently returned {} — and the daily job's PATH is NOT your shell's: launchd
+    hands agents a default PATH with no /opt/homebrew/bin and no ~/.local/bin, so `brew`
+    and `npm` vanished, 192 packages read as REMOVED, and the flood pushed a genuine new
+    install past the render cap. Fail loudly instead; the diff then guards the category."""
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        raise ToolUnavailable("not on PATH: " + ", ".join(missing))
+
 
 def _has(cmd: str) -> bool:
     return bool(run(["sh", "-c", f"command -v {shlex.quote(cmd)}"]).strip())
@@ -751,6 +851,7 @@ def _linux_services():
 
 def _linux_kmods():
     """Loaded kernel modules (lsmod) — a NEW module is the signal."""
+    need("lsmod")
     res = {}
     for line in run(["lsmod"], timeout=10).splitlines()[1:]:
         parts = line.split()
@@ -842,6 +943,9 @@ def _linux_packages():
         cmd = ["pacman", "-Q"]
     else:
         cmd = None
+        if not (_has("snap") or _has("flatpak")):
+            # no package manager at all is reachable — say so rather than return {}
+            raise ToolUnavailable("no package manager on PATH (dpkg-query/rpm/pacman/snap/flatpak)")
     if cmd:
         for line in run(cmd, timeout=40).splitlines():
             p = line.split()
@@ -902,6 +1006,10 @@ def text_sources() -> dict[str, str]:
 
     def add(label, content):
         if content and content.strip():
+            if len(content) > BLOB_MAX:
+                content = (content[:BLOB_MAX]
+                           + f"\n… [truncated at {BLOB_MAX} bytes for storage; "
+                             f"sha of full content={sha(content)}]\n")
             out[label] = content
 
     # cross-platform sensitive files (most paths exist on both macOS and Linux)
@@ -975,6 +1083,7 @@ def take_snapshot(all_cats=True) -> dict:
         "epoch": int(time.time()),
         "euid": EUID,
         "root": IS_ROOT,
+        "tools": tool_identity(),
         "host": (run(["scutil", "--get", "ComputerName"]).strip()
                  if PLATFORM == "macos" else platform_module.node()),
         "collectors": {},
@@ -1050,7 +1159,7 @@ def load_labels() -> dict:
     otherwise crashed `since mark` with a raw TypeError inside save_snapshot, and
     prune_snapshots with an AttributeError. Non-str entries are dropped, not fatal."""
     try:
-        d = json.loads(LABELS_FILE.read_text())
+        d = json.loads(safe_read_text(LABELS_FILE) or "")
     except Exception:
         return {}
     if not isinstance(d, dict):
@@ -1079,7 +1188,10 @@ def safe_load(path: Path):
     `cp backup.json`) must not brick every future `since`/`list` run. Validates the
     required snapshot keys so a `{}` doesn't slip through and later KeyError in render."""
     try:
-        d = json.loads(path.read_text())
+        # safe_read_text, not read_text: a FIFO planted in the snapshots dir (the state dir
+        # is user-writable, and safe_load runs over EVERY *.json in it) blocked forever, so
+        # every `since` invocation hung — including `list` and the daily digest.
+        d = json.loads(safe_read_text(path) or "")
     except Exception:
         return None
     if not (isinstance(d, dict) and "created" in d and "epoch" in d
@@ -1227,7 +1339,7 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
 def load_ignores() -> list[tuple[str, str]]:
     rules = []
     try:
-        for line in IGNORE_FILE.read_text().splitlines():
+        for line in (safe_read_text(IGNORE_FILE) or "").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -1275,10 +1387,12 @@ def undo_hint(category: str, key: str, value) -> str | None:
     # filename/name, and this string is printed for the user to paste into a shell.
     real = key.replace("~", str(HOME), 1) if key.startswith("~") else key
     # cross-platform categories
+    # `--` on every hint whose interpolated value could begin with '-': shell-quoting
+    # stops the SHELL, not the invoked program's own option parser (see login_items).
     if category == "npm_global":
-        return f"npm rm -g {q(key)}"
+        return f"npm rm -g -- {q(key)}"
     if category == "pip":
-        return f"pip3 uninstall {q(key)}"
+        return f"pip3 uninstall -- {q(key)}"
     if category == "browser_extensions":
         return "remove it from your browser's Extensions page"
 
@@ -1288,23 +1402,23 @@ def undo_hint(category: str, key: str, value) -> str | None:
             # simply wrong (and a silent no-op) for a /etc/xdg/autostart entry.
             if key.endswith(SYS_AUTOSTART_TAG):
                 base = key[:-len(SYS_AUTOSTART_TAG)]
-                return f"sudo rm {q('/etc/xdg/autostart/' + base)}"
-            return f"rm {q(str(HOME / '.config/autostart') + '/' + key)}"
+                return f"sudo rm -- {q('/etc/xdg/autostart/' + base)}"
+            return f"rm -- {q(str(HOME / '.config/autostart') + '/' + key)}"
         if category == "launch_items":
             if real.startswith("/etc/init.d/"):
                 return f"sudo update-rc.d {q(os.path.basename(real))} disable"
             unit = key[5:] if key.startswith("user:") else key
             pre = "systemctl --user" if key.startswith("user:") else "sudo systemctl"
-            return f"{pre} disable --now {q(unit)}"
+            return f"{pre} disable --now -- {q(unit)}"
         if category == "kernel_extensions":
             return f"sudo modprobe -r {q(key)}   # blacklist in /etc/modprobe.d to persist"
         if category == "brew":  # system package
-            base = key.rsplit(" (", 1)[0]
+            base = bare_key(key)   # not a hand-rolled rsplit: that ate a package's own '(...)'
             if key.endswith("(snap)"):
-                return f"sudo snap remove {q(base)}"
+                return f"sudo snap remove -- {q(base)}"
             if key.endswith("(flatpak)"):
-                return f"flatpak uninstall {q(base)}"
-            return f"sudo apt remove {q(base)}   # (or dnf/pacman remove)"
+                return f"flatpak uninstall -- {q(base)}"
+            return f"sudo apt remove -- {q(base)}   # (or dnf/pacman remove)"
         return None
 
     # macOS
@@ -1312,15 +1426,29 @@ def undo_hint(category: str, key: str, value) -> str | None:
         # /Library/LaunchDaemons live in the system domain and are root-owned —
         # the gui/$UID + unprivileged rm hint would silently no-op there.
         if real.startswith("/Library/LaunchDaemons"):
-            return f"sudo launchctl bootout system {q(real)} 2>/dev/null; sudo rm {q(real)}"
-        return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; rm {q(real)}"
+            return f"sudo launchctl bootout system {q(real)} 2>/dev/null; sudo rm -- {q(real)}"
+        if real.startswith("/Library/Launch"):
+            # /Library/LaunchAgents is root:wheel drwxr-xr-x — unlinking needs write on the
+            # DIRECTORY, so the unprivileged rm silently failed and the persistence file
+            # survived (it loads in the GUI domain, hence bootout stays gui/$UID).
+            return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; sudo rm -- {q(real)}"
+        return f"launchctl bootout gui/$UID {q(real)} 2>/dev/null; rm -- {q(real)}"
     if category == "login_items":
-        # Pass the name as an argv parameter so it never enters the AppleScript
-        # (or shell) source — a name containing quotes can't break out.
+        # The name is passed as an argv PARAMETER so it never enters the AppleScript
+        # source, and q() quotes it for the shell. Neither is sufficient on its own:
+        # `osascript` parses ITS OWN options out of argv, so a login item named
+        # `-e property zz : (do shell script "...")` was consumed as a second -e chunk and
+        # its property initializer RAN AT LOAD — the "remove this login item" hint executed
+        # the malware author's command instead (verified), while the delete silently
+        # no-opped on an empty argv. `--` ends option parsing: the name arrives as data.
         return ("osascript -e 'on run argv' "
                 "-e 'tell application \"System Events\" to delete login item (item 1 of argv)' "
-                f"-e 'end run' {q(key)}")
+                f"-e 'end run' -- {q(key)}")
     if category == "brew":
+        # bare_key: the key is `foo (cask)`, and `brew uninstall 'foo (cask)'` names no
+        # formula at all — every new cask got a hint that just errored out.
+        if key.endswith(" (cask)"):
+            return f"brew uninstall --cask {q(bare_key(key))}"
         return f"brew uninstall {q(key)}"
     if category == "kernel_extensions":
         return f"sudo kmutil unload -b {q(key)}   # then reboot"
@@ -1338,6 +1466,44 @@ def _is_priv_blob(key: str) -> bool:
             or "/etc/ld.so.preload" in key)
 
 
+# Categories whose data is defined by an EXTERNAL tool that the user installed, so *which*
+# binary answered matters as much as whether one did: /usr/bin/pip3 and /opt/homebrew/bin/pip3
+# report different package sets, and the daily job resolves a different PATH than your shell.
+# The resolved path is stamped into each snapshot (like euid) and compared before diffing.
+CAT_TOOLS = {"brew": "brew", "npm_global": "npm", "pip": "pip3", "mac_app_store": "mas"}
+
+
+def tool_identity() -> dict:
+    return {cat: (shutil.which(tool) or "") for cat, tool in CAT_TOOLS.items()}
+
+
+def unusable_cats(baseline: dict, current: dict) -> dict:
+    """{category: why} for categories whose collector FAILED in exactly one of the two
+    snapshots. Comparing those fabricates mass add/remove — the same trap the privilege
+    guard closes for listening/outbound. If it failed in BOTH there is nothing to compare
+    either way, so skip silently; a one-sided failure is what the user must be told about."""
+    be = baseline.get("errors", {}) or {}
+    ce = current.get("errors", {}) or {}
+    out = {}
+    for k in set(be) | set(ce):
+        if k in CAT and (k in be) != (k in ce):
+            out[k] = ce.get(k) or be.get(k) or "collector failed"
+    # Same trap, subtler: the tool RAN in both snapshots but it wasn't the same binary
+    # (a shell run finds /opt/homebrew/bin/pip3, the launchd job finds /usr/bin/pip3), so
+    # every package looks swapped. Fail CLOSED when either side is unstamped (pre-v0.4.4):
+    # we can't confirm they agree, and a fabricated flood can bury a real install.
+    bt, ct = baseline.get("tools"), current.get("tools")
+    for cat in CAT_TOOLS:
+        if cat in out or cat not in CAT:
+            continue
+        if bt is None or ct is None:
+            out[cat] = "baseline predates tool stamping — can't confirm the same tool"
+        elif bt.get(cat, "") != ct.get(cat, ""):
+            out[cat] = (f"a different tool answered: {bt.get(cat) or '(none)'} "
+                        f"vs {ct.get(cat) or '(none)'}")
+    return out
+
+
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
                    skip_priv_blobs=False) -> list[dict]:
     rules = load_ignores()
@@ -1349,6 +1515,11 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
             continue
         base = baseline.get("collectors", {}).get(key, {})
         cur = current.get("collectors", {}).get(key, {})
+        # safe_load validates that `collectors` is a dict but not its VALUES: a snapshot
+        # holding `{"brew": ["x"]}` (hand-edited, half-written, restored from junk) passed
+        # validation and then raised TypeError here, killing the whole report.
+        if not isinstance(base, dict) or not isinstance(cur, dict):
+            continue
         added, removed, changed = diff_dicts(base, cur)
         for action, items in (("added", {k: cur[k] for k in added}),
                               ("removed", {k: base[k] for k in removed}),
@@ -1380,7 +1551,15 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                 f = {"category": key, "label": meta["label"], "cls": meta["cls"],
                      "action": action, "key": k, "value": v,
                      "level": level, "trust": None, "why": None, "undo": None, **extra}
-                _enrich(f, current)
+                # Enrichment (trust check, attribution, undo hint) parses ATTACKER-WRITTEN
+                # files at diff time. Collectors are all failure-isolated; this path was not,
+                # and `main` catches only KeyboardInterrupt — so one malformed plist killed
+                # the entire digest, saved no snapshot, and therefore recurred every day.
+                # Degrade ONE finding instead of the report; the finding itself still shows.
+                try:
+                    _enrich(f, current)
+                except Exception as e:
+                    f["trust"] = f"enrichment failed ({type(e).__name__})"
                 findings.append(f)
     # text blobs (system files)
     bb, bc = baseline.get("blobs", {}), current.get("blobs", {})
@@ -1393,8 +1572,18 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
         if skip_priv_blobs and _is_priv_blob(key):
             continue
         status = "added" if ob is None else "removed" if oc is None else "changed"
-        udiff = list(difflib.unified_diff((ob or "").splitlines(), (oc or "").splitlines(),
-                                          lineterm="", n=0))[2:]
+        # difflib is O(n^2) on adversarial input: ~100 distinct repeated lines defeat its
+        # autojunk heuristic, so a planted 0.74MB ~/.zshrc took 32s of a real digest run
+        # (MAX_READ bounds the READ at 8MB; nothing bounded the DIFF). Above the cap report
+        # the change WITHOUT a line diff — same key, same severity, just no line detail.
+        ob_l, oc_l = (ob or "").splitlines(), (oc or "").splitlines()
+        if (max(len(ob_l), len(oc_l)) > DIFF_MAX_LINES
+                or max(len(ob or ""), len(oc or "")) > DIFF_MAX_BYTES):
+            udiff = [f"+ (file too large to diff line-by-line: "
+                     f"{len(oc_l)} lines, {human_size(len(oc or ''))}; "
+                     f"content hash {sha(oc or '')})"]
+        else:
+            udiff = list(difflib.unified_diff(ob_l, oc_l, lineterm="", n=0))[2:]
         level = ORANGE if status == "changed" else YELLOW
         if any(s in key for s in SENSITIVE_TEXT):
             level = max(level, ORANGE)
@@ -1762,13 +1951,21 @@ def cmd_diff(args, notify_on=False):
         notes.append(pn)
     skip = ()
     skip_priv_blobs = False
+    # Capability guard: a collector that couldn't run in ONE of the two snapshots (tool not
+    # on PATH — the daily job's PATH differs from your shell's — or a timeout) would
+    # otherwise report its whole category as removed/added.
+    unusable = unusable_cats(baseline, current)
+    if unusable:
+        skip = tuple(unusable)
+        for cat, why in sorted(unusable.items()):
+            notes.append(f"{CAT[cat]['label']}: comparison skipped — {clean(str(why))[:110]}")
     base_root = baseline.get("root")  # None on unstamped (pre-v0.3) snapshots
     if base_root is None:
-        skip, skip_priv_blobs = PRIV_SENSITIVE_CATS, True
+        skip, skip_priv_blobs = tuple(set(skip) | set(PRIV_SENSITIVE_CATS)), True
         notes.append("baseline predates privilege stamping — listening/outbound and "
                      "sudoers/crontab comparison skipped (can't confirm same privilege).")
     elif base_root != current.get("root"):
-        skip, skip_priv_blobs = PRIV_SENSITIVE_CATS, True
+        skip, skip_priv_blobs = tuple(set(skip) | set(PRIV_SENSITIVE_CATS)), True
         notes.append("baseline and now were taken at different privilege levels "
                      f"({'root' if base_root else 'user'} vs "
                      f"{'root' if current.get('root') else 'user'}) — "

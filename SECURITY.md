@@ -39,10 +39,17 @@ consequences follow, and neither is fixable from inside the tool:
   its own history. For a baseline an attacker on the box cannot reach, copy snapshots off
   the machine (or keep them on append-only/read-only storage) and diff them there.
 - **Helper binaries are resolved through `PATH`.** `lsof`, `ss`, `systemctl`, `codesign`,
-  `brew` and friends are invoked by name, so an interactive run with a hostile `PATH` (say
-  a fake `lsof` earlier in it) can filter the very output the report is built from. The
-  installed daily job runs under launchd/systemd with a minimal `PATH` and is not exposed
-  to a hostile shell environment.
+  `brew` and friends are invoked by name, so a run with a hostile `PATH` (say a fake `lsof`
+  earlier in it) can filter the very output the report is built from. `install.sh` **pins**
+  the daily job's `PATH` at install time, copying your shell's resolution order, because it
+  must: launchd hands an agent a default `PATH` containing neither `/opt/homebrew/bin` nor
+  `~/.local/bin`, so an unpinned job could not see `brew`/`npm`/`pip3` at all. That pinning
+  is a deliberate trade: the job's `PATH` therefore includes user-writable directories (a
+  Homebrew prefix, `~/.local/bin`), so a process running as you could substitute a helper
+  binary there — the same privilege that already lets it rewrite your baselines. `since`
+  detects changes to the system; it does not attest to the integrity of the tools it asks.
+  If a collector's tool is missing, or a *different* binary answers than last time, the
+  affected category is **skipped with a note** rather than reported as mass removals.
 
 Also by design: without `sudo` the listener/outbound view is partial and `/etc/sudoers` is
 unreadable (`since caps` lists exactly what is and isn't covered), and snapshots taken at
