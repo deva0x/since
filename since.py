@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace

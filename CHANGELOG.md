@@ -2,6 +2,73 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.5] — 2026-07-25
+
+Two further adversarial rounds against v0.4.4, then a **restructure of `redact()`** and its first
+**property tests**. 24 findings, each reproduced by execution before being fixed and pinned by a
+mutation-tested regression test (**72/72 mutations caught**). Suite 228 → **463** (287
+example-based + 176 property). Every Linux-only path is now verified on a real Ubuntu 24.04 box,
+not just on CI's ubuntu runners.
+
+**`redact()` restructured — the root cause, not another instance.** Its matcher took the value as
+`(\S.*)$` — rest-of-line — and nearly every leak and hidden attack in this project's history
+followed from that: a "show" decision exempted every later secret on the line, a "mask" decision
+swallowed the rest of the attack, and the recursive rescan added to patch the first half became an
+unprivileged kill switch. The value is now a **single token** (or an atomic quoted run), so
+`re.sub` continues after each match and every assignment is decided **independently** — no
+recursion, no depth cap, no tail semantics. Verified property:
+`redact("a; b") == redact("a") + "; " + redact("b")` over 2700 random compositions.
+
+**Property tests** (`tests/test_redact_properties.py`, stdlib-only with fixed seeds — no new
+dependency, and failures replay from the printed seed) assert no-leak, no-hide, idempotence,
+totality, bounded cost, marker-independence, pre-filter soundness and compositionality. They
+immediately found three bugs 239 example tests had missed, including `redact("")` raising
+**IndexError** — `line[:1] in "+-"` is true for the empty string.
+
+**Fixed — credential leaks:** a `/`-preceded key exempted real assignments
+(`//registry.npmjs.org/_authToken=<secret>`, `https://host/api_key=<secret>`) · a token passed as
+argv to a credential-named script (`/opt/bin/refresh_token <secret>`) · `;`-chained secrets after
+a shown path · `/`- and `$`-leading values under `*_FILE`/`*_PATH` keys · `sshpass -p <secret>`,
+`mysql -u root -p<secret>`, `https://<token>@github.com`, `MYSQL_PWD=` · sudoers exemption
+bypasses (a lowercase token posing as a tag; `ALL=<secret>`).
+
+**Fixed — hidden attacks:** `SSH_AUTH_SOCK`/`*_ASKPASS`/`PGPASSFILE` hijacks were fully redacted ·
+`SSH_ASKPASS=/evil` (a single-segment path) · `PasswordAuthentication=yes` (the `Key=value`
+spelling) · sudoers command specs (`PASSWD:NOEXEC:`, `ALL, !/usr/bin/su`, and the account being
+reset) · a payload past `BLOB_MAX` lost its RED escalation · the flag escalation was suppressible
+by planting one benign decoy comment (flags are now **counts**, so any increase escalates) · a
+malicious LaunchAgent reported `signature: Apple-signed` — that is the *interpreter's* signature,
+and padding `argv[0]` evaded the payload scan entirely.
+
+**Fixed — availability:** two more unprivileged **kill switches** (a `RecursionError` from ~800
+credential keys on one line, and a non-container `blob_flags` value), each of which died before
+saving a snapshot and therefore recurred **every day, forever** · `curl[^\n|]*\|` was still
+unbounded and quadratic in line length (8 MB of 4096-column lines: **20.2 s → 13 ms** at snapshot
+time) · a planted snapshot filename simply **became the baseline** · `safe_load` validated field
+presence but not types, so an int `created` or blob value crashed the run permanently.
+
+**Fixed — the capability guard's own bugs:** `recover_baselines` (added in 0.4.4 to stop a blind
+day becoming its own baseline) recovered **ephemeral** categories across a **privilege
+mismatch** — a 3-day-old root-taken listener set produced 27 fabricated ORANGE findings and fired
+the notification, re-opening the exact flood the guard exists to prevent. It is now restricted to
+durable inventory, requires a matching *stamped* privilege level, and may not reach forward of the
+requested baseline. `run_checked` covered only half of `_mac_brew` and **none** of
+`_linux_packages`; `CAT_TOOLS` stamped `brew` on Linux, where that category is dpkg/rpm/pacman —
+so the whole guard was a **no-op on Linux**.
+
+**Fixed — `install.sh` silently disabled all monitoring.** `[ -d "$1" ] || return` propagated
+status 1 for a `PATH` entry that does not exist (`/snap/bin` on a box without snapd), and under
+`set -euo pipefail` that aborted the installer immediately after the first snapshot: no prompt, no
+units, no daily job, exit 1, **no error message**. Found on the real box; neither CI nor a
+container check could see it.
+
+**Verified on a real Ubuntu 24.04 box** (the three items outstanding since v0.4.0/v0.4.4 are now
+discharged): the systemd `--user` timer installs, arms and **runs** with its pinned
+`Environment=PATH=`; the headless-session guard writes the units and prints the finishing steps
+instead of aborting; `_systemctl_execstart` parses **real** `systemctl show` output and a genuine
+drop-in `ExecStart` override changes the fingerprint; all 8 Linux collectors work (763 packages);
+`LOST VISIBILITY` fires when `dpkg-query` breaks; every undo hint carries its `--` guard.
+
 ## [0.4.4] — 2026-07-25
 
 A security release fixing **16 issues found by reviewing v0.4.3 itself** — each reproduced by
