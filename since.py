@@ -280,14 +280,25 @@ _PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _SECRET_KW = (r"secret|pass(?:wd|word|phrase)?|[_-]pwd|token|api[_-]?key|access[_-]?key|"
               r"client[_-]?secret|private[_-]?key|authoriz|[_-]auth|credential|"
               r"oauth2?[_-]?bearer")
-_KV_RE = re.compile(r"(?i)([\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
-                    r"(\s*[:=]\s*|\s+)(\S.*)$")
-# Linear, backtrack-free pre-filter. _KV_RE can only match if one of these keywords is
-# present, but its bounded `[\w.\-]{0,64}` runs are retried at EVERY offset (~3µs/char) —
-# on a long keyword-free word-char line that dominated redact(). Sound by construction:
-# any _KV_RE match implies a _KV_KW_RE match on the same line.
+# ONE assignment: a credential-ish KEY, a separator, and a value that STOPS at the first
+# whitespace or shell separator (or spans a quoted run, which is atomic).
+#
+# This bound is the whole design. The previous matcher took the value as `(\S.*)$` —
+# rest-of-line — and every bug in this function's history followed from it: a "show" decision
+# exempted every later secret on the line, a "mask" decision swallowed the rest of the attack,
+# and the recursive rescan bolted on to fix the first half became an unprivileged kill switch
+# (RecursionError on ~800 keys in one line). With a single-token value, `re.sub` simply
+# continues scanning after each match, so every assignment on a line is decided INDEPENDENTLY
+# with no recursion, no depth cap, and no tail semantics to get wrong.
+_VALUE = r'"[^"\n]{0,512}"|\'[^\'\n]{0,512}\'|[^\s;&|]+'
+_ASSIGN_RE = re.compile(r"(?i)(?P<key>[\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
+                        r"(?P<sep>\s*[:=]\s*|\s+)(?P<val>" + _VALUE + r")")
+# Linear, backtrack-free pre-filter: _ASSIGN_RE can only match where one of these keywords is,
+# but its bounded `[\w.\-]{0,64}` runs are retried at every offset. Sound by construction —
+# any _ASSIGN_RE match implies a _KV_KW_RE match on the same line.
 _KV_KW_RE = re.compile("(?i)" + _SECRET_KW)
-_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})")  # auth headers
+_SCHEME_RE = re.compile(
+    r"(?i)\b(bearer|basic|token|apikey|api-key|digest|negotiate)\s+([A-Za-z0-9._~+/=-]{6,})")
 _URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
 # `https://<token>@github.com/...` — the standard way to embed a GitHub/GitLab PAT, and
 # `.gitconfig` is tracked. No colon, so _URLAUTH_RE never saw it. Length+entropy gated so
@@ -343,6 +354,9 @@ _SUDO_TAG_RE = re.compile(r"^(?:NO)?(?:PASSWD|EXEC|SETENV|LOG_INPUT|LOG_OUTPUT|"
 # The looser test leaked: a base64 secret starts with '/' about 1 time in 64 and every
 # crypt/bcrypt hash starts with '$', so `SECRET_FILE=/hunter2…` printed in cleartext.
 _REAL_PATH_RE = re.compile(r"^(?:/[^/\s]+/|~/|\./|\.\./|\$\{?\w+\}?/)")
+# `$VAR` / `${VAR}` in full: a reference, not a value. Requires a LETTER or '_' first, so a
+# crypt/shadow hash (`$6$rounds$…`) is not mistaken for one and still redacts.
+_VAR_REF_RE = re.compile(r"^\$\{?[A-Za-z_]\w*\}?$")
 _PATH_VALUED_KEY_RE = re.compile(
     r"(?i)(askpass|passfile|pass_file|keysfile|keyscommand|[_-]sock$|_socket$|"
     r"[_-]file$|[_-]dir$|[_-]path$)")
@@ -382,7 +396,11 @@ def redact(line: str) -> str:
     # PEM body / raw key material on EITHER side of a unified diff. The char class is
     # +-agnostic, so strip the one-char diff marker before testing — otherwise a key
     # body printed raw on a `-` (removed) line while the `+` line is redacted.
-    marker = line[0] if line[:1] in "+-" else ""
+    # NOTE the tuple: `line[:1] in "+-"` is ALSO true for the empty string ("" is a substring
+    # of everything), so redact("") raised IndexError — found by the no-raise property test.
+    # The marker is NOT stripped from `line` itself: a body can legitimately begin with '-'
+    # (a `.curlrc` `-u user:pass` line), and eating that character broke its masking.
+    marker = line[0] if line[:1] in ("+", "-") else ""
     core = line[1:] if marker else line
     if _B64LINE_RE.match(core.strip()):
         return f"{marker}«redacted (key material)»"
@@ -398,79 +416,62 @@ def redact(line: str) -> str:
     line = _USERPASS_RE.sub(r"\1«redacted»", line)
     line = _TOKEN_RE.sub("«redacted»", line)
 
-    def _show(m, key, sep, val, depth):
-        """A SHOW decision must expose only THIS key's value, not the whole rest of the line:
-        `_KV_RE`'s value group runs to end-of-line, so returning it verbatim also exempted any
-        later secret on the same line (`AuthorizedKeysCommand /usr/bin/fk --api-key=<secret>`).
-        Re-scan the tail — but BOUND the nesting: "each pass consumes its own key so it
-        terminates" was true and useless, because one line can hold hundreds of keys. A 2.5KB
-        comment of repeated `_pwd ` (well under _REDACT_MAX, so truncation did not help)
-        recursed ~800 deep and raised RecursionError, which nothing catches: the digest died
-        before saving a snapshot, so the planted line stayed "added" and every later run died
-        identically — an unprivileged one-line kill switch. At the cap, fail SAFE (redact)."""
-        if depth >= _SHOW_MAX_DEPTH:
-            return f"{key}{sep}«redacted»"
-        inner = (_KV_RE.sub(lambda mm: _kv(mm, depth + 1), val)
-                 if _KV_KW_RE.search(val) else val)
-        inner = _CMDPASS_RE.sub(lambda mm: f"{mm.group(1)}«redacted»", inner)
-        return f"{key}{sep}{inner}"
+    # ---- assignment pass: every `key<sep>value` on the line, decided INDEPENDENTLY ----
+    # The decision table, in order. Each rule states WHY, because every one of them exists
+    # because its absence caused a real leak or hid a real attack:
+    #
+    #   1. key is a PATH COMPONENT (preceded by '/', whitespace separator)   -> SHOW
+    #      `NOPASSWD: /usr/bin/passwd backdoor2026` — the "key" is the granted command and the
+    #      "value" is its argument; masking it hid which account gets reset. Whitespace only:
+    #      `//registry.npmjs.org/_authToken=<secret>` is an assignment, not a path.
+    #   2. key is a sudoers TAG and the value opens a command spec                -> SHOW
+    #      The granted command list is the payload of a sudoers diff.
+    #   3. key NAMES a credential (HARD):
+    #        assignment separator ('=' / ':')                                     -> MASK
+    #          except a config keyword (`PasswordAuthentication=yes`) or a real path under a
+    #          path-valued key (`SSH_ASKPASS=/tmp/steal.sh`) — both are the attack itself.
+    #        whitespace separator: prose or a directive (`password required pam_unix.so`,
+    #          `PASS_MAX_DAYS 99999`)                                             -> SHOW
+    #          unless the value is credential-shaped (>=6 chars, >=2 char classes).
+    #   4. key merely CONTAINS a directive name (`AuthorizedKeysFile`, SOFT)      -> SHOW
+    def _assignment(m):
+        key, sep, val = m.group("key"), m.group("sep"), m.group("val")
+        # A leading diff marker can join the key, because '-' is in the key's char class:
+        # `-AuthorizedKeysFile` turned the SOFT `Authorized*` directive into a HARD `[_-]auth`
+        # match, so the `-` (removed) form was REDACTED while the `+` form was shown. Classify
+        # on the marker-free key so no rule can depend on which side of the diff it came from.
+        kcls = key.lstrip("+-")          # for CLASSIFICATION only
+        bare = val.strip("\"'")
+        masked = f"{key}{sep}«redacted»"  # output keeps the original key, marker included
+        assigned = (":" in sep) or ("=" in sep)
 
-    def _kv(m, depth=0):
-        key, sep, val = m.group(1), m.group(2), m.group(3)
-        tok = val.split()[0] if val.split() else ""
-        # A key preceded by '/' is a FILENAME component, not an assignment target: in
-        # `NOPASSWD: /usr/bin/passwd backdoor2026` the "key" is the command being granted, and
-        # treating it as a credential redacted the account being reset — the single most
-        # important detail in a sudoers diff. Same for `/usr/local/bin/passwd_sync.sh --dest …`.
-        # …but ONLY when the separator is WHITESPACE. A '/'-preceded key followed by '=' or ':'
-        # is still an ASSIGNMENT, not a path component, and exempting those leaked real
-        # credentials: `//registry.npmjs.org/_authToken=<secret>` (a genuine .npmrc spelling),
-        # `https://host/api_key=<secret>`, `/etc/foo/password=<secret>`. The case this rule exists
-        # for — `NOPASSWD: /usr/bin/passwd backdoor2026` — is whitespace-separated.
-        if (m.start(1) > 0 and m.string[m.start(1) - 1] == "/"
-                and ":" not in sep and "=" not in sep):
-            return _show(m, key, sep, val, depth)
-        # sudoers TAGS are grants, not secrets — but gate on the EXACT uppercase tag, not a
-        # substring: `"nopasswd" in key` also exempted `export NOPASSWD_TOKEN=<secret>`.
-        if key in _SUDO_TAGS and ":" in sep and _sudo_cmd_spec(tok):
-            # INTACT, deliberately: the granted command list is the payload of a sudoers diff
-            # (which account is reset, which host the command talks to). Rescanning it masked
-            # exactly that. Known credential shapes inside it were already masked above by
-            # _CMDPASS_RE / _TOKEN_RE / _SCHEME_RE, which run over the whole line first.
-            return m.group(0)
-        if _HARD_SECRET_RE.search(key):
-            # The key literally NAMES a credential, so the value IS the secret.
-            # An assignment (`password=…`, `_auth:…`, `SSHPASS=…`) redacts UNCONDITIONALLY:
-            # a token can begin with '/' (base64 alphabet) or '$' (a crypt/shadow hash), so
-            # a "first char looks like a path/var-ref" test would leak it. A whitespace
-            # separator is prose or a pam/login.defs directive (`password required …`,
-            # `PASS_MAX_DAYS 99999`) — show short/keyword/single-class values, redact only
-            # a credential-shaped one (`password hunter2mixed`).
-            if (":" in sep) or ("=" in sep):
-                # …with two exceptions, both of which are ATTACKS whose value is the whole
-                # point: a config keyword (`PasswordAuthentication=yes` — the valid `Key=value`
-                # spelling of a directive we already show in its whitespace form), and a
-                # path under a path-valued key (`SSH_ASKPASS=/tmp/steal.sh`). Anything else
-                # stays unconditionally masked: a real token can begin with '/' or '$'.
-                if len(val.split()) == 1 and (
-                        tok.lower() in _KW_VALUES
-                        or (_PATH_VALUED_KEY_RE.search(key) and _REAL_PATH_RE.match(tok))):
-                    # _show, NOT m.group(0): "one whitespace token" does NOT mean "nothing
-                    # follows" — a shell chains with ';'/'&&'/'|', so
-                    # `SSH_ASKPASS=/tmp/a.sh;MYSQL_PWD=<secret>` printed the password.
-                    return _show(m, key, sep, val, depth)
-                return f"{key}{sep}«redacted»"
-            if _is_directive_value(tok) or len(tok) < 6 or _char_classes(tok) < 2:
-                return _show(m, key, sep, val, depth)
-            return f"{key}{sep}«redacted»"
-        # SOFT (falls through to _show, which re-scans the tail — see L5):
-        # the key only CONTAINS a directive name (`AuthorizedKeysFile`,
-        # `AuthorizedKeysCommandUser`, `Authorization`). Its value is a path (absolute OR
-        # relative like `.ssh/authorized_keys`), a username, or a keyword — real token
-        # shapes were already masked by the regexes above. SHOW it, so a malicious
-        # AuthorizedKeys* change stays visible (the whole point of #2).
-        return _show(m, key, sep, val, depth)
-    return _KV_RE.sub(_kv, line) if _KV_KW_RE.search(line) else line
+        if (m.start("key") > 0 and m.string[m.start("key") - 1] == "/" and not assigned):
+            return m.group(0)                                              # 1
+        if kcls in _SUDO_TAGS and ":" in sep and _sudo_cmd_spec(bare):
+            return m.group(0)                                              # 2
+        if _HARD_SECRET_RE.search(kcls):                                    # 3
+            if assigned:
+                # NO var-ref exemption here, deliberately: `SSHPASS=$ecretPassw0rd` and
+                # `API_KEY_FILE=$hunter2Xyz9` are indistinguishable from `$VAR` by shape, and
+                # v0.4.2 already shipped that leak once. Under an assignment a HARD key's value
+                # is the secret unless it is a config keyword or a real path under a
+                # path-valued key. (The whitespace branch below can afford the exemption: its
+                # values are directives, e.g. nginx `Authorization $http_authorization;`.)
+                if (bare.lower() in _KW_VALUES
+                        or (_PATH_VALUED_KEY_RE.search(kcls) and _REAL_PATH_RE.match(bare))):
+                    return m.group(0)
+                return masked
+            # keyword / short / single-class only. NOT "starts with / ~ $": that first-char
+            # test showed `CREDENTIAL /t_wvSrE+2I.23-VqI33q` in cleartext (property test P1).
+            # Legitimate whitespace-separated directive values are keywords or numbers
+            # (`password required pam_unix.so`, `PASS_MAX_DAYS 99999`), never paths.
+            if (bare.lower() in _KW_VALUES or _VAR_REF_RE.match(bare)
+                    or len(bare) < 6 or _char_classes(bare) < 2):
+                return m.group(0)
+            return masked
+        return m.group(0)                                                  # 4
+
+    return _ASSIGN_RE.sub(_assignment, line) if _KV_KW_RE.search(line) else line
 
 
 # ---------------------------------------------------------------------------

