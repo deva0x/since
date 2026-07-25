@@ -5,8 +5,11 @@ privilege guard, corruption tolerance) plus the core diff/time primitives.
 
 Run:  python3 -m pytest   (or just: pytest)
 """
+import contextlib
 import json
+import os
 import shlex
+import signal
 import time
 
 import pytest
@@ -481,3 +484,323 @@ def test_write_private_survives_stale_temp(tmp_path):
     since._write_private(target, "hello")
     assert target.read_text() == "hello"
     assert oct(target.stat().st_mode)[-3:] == "600"
+
+
+# =========================================================================== #
+# Third independent (Kimi) audit v3 — a regression test per fixed finding.     #
+# =========================================================================== #
+
+class _Hang(BaseException):
+    """BaseException on purpose: the collectors wrap their reads in `except Exception`,
+    which would SWALLOW a plain TimeoutError and make a hang look like a pass."""
+
+
+@contextlib.contextmanager
+def deadline(seconds=5.0):
+    """Fail (don't wedge the suite) if the body blocks — the only honest way to test a
+    hang: a blocking FIFO read cannot be detected by inspecting a return value."""
+    def _boom(signum, frame):
+        raise _Hang(f"blocked >{seconds}s — the read is not guarded")
+    old = signal.signal(signal.SIGALRM, _boom)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+# v3 #1 (High) — a planted FIFO / device symlink in a monitored dir must not hang the
+# collector. Unguarded, each of these blocks forever inside take_snapshot(), so the daily
+# `digest --notify` never prints, never saves, never notifies: a silently dead watchdog.
+def test_is_regular_rejects_fifo_and_device(tmp_path):
+    fifo = tmp_path / "f"
+    os.mkfifo(fifo)
+    dev = tmp_path / "z"
+    os.symlink("/dev/zero", dev)
+    real = tmp_path / "r"
+    real.write_text("x")
+    link = tmp_path / "l"
+    os.symlink(real, link)                  # symlink TO a regular file is still fine
+    assert since.is_regular(real) and since.is_regular(link)
+    assert not since.is_regular(fifo) and not since.is_regular(dev)
+    assert not since.is_regular(tmp_path)   # a directory is not a readable file either
+    assert not since.is_regular(tmp_path / "missing")
+
+
+def test_launch_items_survive_fifo_and_report_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    d = tmp_path / "Library/LaunchAgents"
+    d.mkdir(parents=True)
+    os.mkfifo(d / "evil.plist")
+    os.symlink("/dev/zero", d / "zero.plist")
+    with deadline():
+        out = since._mac_launch_items()
+    # reported, not silently dropped: a FIFO in LaunchAgents is itself anomalous
+    assert "not a regular file" in out["~/Library/LaunchAgents/evil.plist"]
+    assert "not a regular file" in out["~/Library/LaunchAgents/zero.plist"]
+
+
+def test_linux_autostart_survives_fifo_and_reports_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "SYS_AUTOSTART_DIR", tmp_path / "nonexistent")
+    d = tmp_path / ".config/autostart"
+    d.mkdir(parents=True)
+    os.mkfifo(d / "evil.desktop")
+    with deadline():
+        out = since._linux_autostart()
+    assert "not a regular file" in out["evil.desktop"]
+
+
+@pytest.mark.parametrize("collector,ext_path", [
+    ("_mac_browser_extensions",
+     "Library/Application Support/Google/Chrome/Default/Extensions/abcd/1.0"),
+    ("_linux_browser_extensions",
+     ".config/google-chrome/Default/Extensions/abcd/1.0"),
+])
+def test_browser_extensions_survive_fifo_manifest(monkeypatch, tmp_path, collector, ext_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    d = tmp_path / ext_path
+    d.mkdir(parents=True)
+    os.mkfifo(d / "manifest.json")
+    with deadline():
+        out = getattr(since, collector)()
+    # the extension is still inventoried (by id) — only the unreadable manifest is skipped
+    assert any(k.endswith(":abcd") for k in out), out
+
+
+def test_linux_browser_extensions_skip_temp_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    (tmp_path / ".config/google-chrome/Default/Extensions/Temp").mkdir(parents=True)
+    assert not any(k.endswith(":Temp") for k in since._linux_browser_extensions())
+
+
+# v3 #2 (Medium) — `Authorization: <token>` IS the credential and must be masked; the
+# `Authorized*` sshd directives must stay visible (they differ from index 8 on).
+@pytest.mark.parametrize("line", [
+    '+header = "Authorization: c2VjcmV0dG9rZW4xMjM0"',
+    '+Authorization: Token c2VjcmV0dG9rZW4xMjM0',
+    '+Authorization: c2VjcmV0dG9rZW4xMjM0',
+])
+def test_authorization_header_is_redacted(line):
+    assert "c2VjcmV0dG9rZW4xMjM0" not in since.redact(line)
+
+
+@pytest.mark.parametrize("line", [
+    "+AuthorizedKeysFile /tmp/evil/keys",
+    "+AuthorizedKeysFile .ssh/authorized_keys",
+    "+AuthorizedKeysCommandUser nobody",
+    "+proxy_set_header Authorization $http_authorization;",
+])
+def test_authorized_directives_still_visible(line):
+    assert since.redact(line) == line
+
+
+# v3 #3 (Medium) — redact() is bounded ABSOLUTELY: a keyword-free long line short-circuits
+# on the linear pre-filter, and any line is capped at _REDACT_MAX before the regexes run.
+# `--json` redacts every diff line, so an unbounded per-line cost stalls the whole digest.
+def test_redact_is_bounded_on_huge_lines():
+    for line in ("+user " + "a" * 400_000, "+password=" + "a" * 400_000):
+        t = time.time()
+        out = since.redact(line)
+        assert time.time() - t < 0.5, "redact() cost is not bounded"
+        assert len(out) < since._REDACT_MAX + 200
+    assert "truncated" in since.redact("+user " + "a" * 400_000)
+    assert "«redacted»" in since.redact("+password=" + "a" * 400_000)
+
+
+def test_redact_prefilter_matches_the_matcher():
+    # The soundness invariant of the short-circuit: anything _KV_RE can match, the cheap
+    # pre-filter must also match — otherwise that key silently stops being redacted.
+    # (`authoriz` is deliberately SOFT: it gates the shown `Authorized*` directives.)
+    for kw in ("secret", "passwd", "password", "passphrase", "token", "api_key",
+               "access-key", "client_secret", "private_key", "authoriz", "_auth",
+               "credential", "authorization"):
+        line = f"+x{kw}y=SoMeV4lue"
+        assert since._KV_RE.search(line), kw          # the matcher fires
+        assert since._KV_KW_RE.search(line), kw       # …so the pre-filter must too
+        if kw != "authoriz":                          # every HARD keyword still redacts
+            assert "«redacted»" in since.redact(line), kw
+
+
+# v3 #4 (Low) — a sudoers `PASSWD:` TAG prefixes a command list; redacting it hid the
+# attack. The carve-out is value-shape gated, so a real `PASSWD=<secret>` still redacts.
+@pytest.mark.parametrize("line", [
+    "+eviluser ALL=(ALL) PASSWD: /tmp/miner",
+    "+eviluser ALL=(ALL) PASSWD: ALL",
+    "+eviluser ALL=(ALL) NOPASSWD: /tmp/miner",
+])
+def test_sudoers_passwd_tag_shows_command_list(line):
+    assert since.redact(line) == line
+
+
+@pytest.mark.parametrize("line", ["+PASSWD=hunter2Mixed", "+PASSWD: hunter2Mixed",
+                                  "+passwd: hunter2Mixed"])
+def test_passwd_assignment_still_redacted(line):
+    assert "hunter2Mixed" not in since.redact(line)
+
+
+# v3 #5 (Low) — the two XDG autostart dirs hold same-named files; a bare basename key let
+# the system copy overwrite (hide) a planted user entry, and the undo hint pointed `rm` at
+# the wrong directory for system entries.
+def test_autostart_user_and_system_entries_do_not_collide(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    sysdir = tmp_path / "xdg"
+    sysdir.mkdir()
+    monkeypatch.setattr(since, "SYS_AUTOSTART_DIR", sysdir)
+    user = tmp_path / ".config/autostart"
+    user.mkdir(parents=True)
+    (user / "x.desktop").write_text("[Desktop Entry]\nName=Evil\nExec=/tmp/miner\n")
+    (sysdir / "x.desktop").write_text("[Desktop Entry]\nName=Benign\nExec=/usr/bin/true\n")
+    out = since._linux_autostart()
+    assert "x.desktop" in out and "x.desktop (system)" in out
+    assert "Evil" in out["x.desktop"] and "Benign" in out["x.desktop (system)"]
+
+
+def test_autostart_undo_hint_targets_the_right_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "PLATFORM", "linux")
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    assert since.undo_hint("login_items", "x.desktop", None) == \
+        f"rm {shlex.quote(str(tmp_path / '.config/autostart/x.desktop'))}"
+    assert since.undo_hint("login_items", "x.desktop (system)", None) == \
+        "sudo rm /etc/xdg/autostart/x.desktop"
+
+
+# v3 #6 (Low) — the ' (~/Applications)' disambiguator is not part of the app's PATH; with
+# it, trust_of() got a path that never exists, so an unsigned app there never hit RED.
+def test_user_applications_app_is_trust_checked(monkeypatch):
+    seen = []
+    monkeypatch.setattr(since, "trust_of", lambda p: (seen.append(p) or ("unsigned", True)))
+    f = {"category": "applications", "action": "added", "key": "Evil (~/Applications)",
+         "value": "/Users/x/Applications", "level": since.GREEN, "label": "app"}
+    since._enrich(f, {})
+    assert seen == ["/Users/x/Applications/Evil.app"]
+    assert f["level"] == since.RED, "unsigned app in ~/Applications must escalate"
+
+
+def test_bare_key_strips_only_our_own_tags():
+    assert since.bare_key("Evil (~/Applications)") == "Evil"
+    assert since.bare_key("code (snap)") == "code"
+    assert since.bare_key("rectangle (cask)") == "rectangle"
+    assert since.bare_key("x.desktop (system)") == "x.desktop"
+    assert since.bare_key("Final Cut Pro (2024)") == "Final Cut Pro (2024)"   # not ours
+    assert since.bare_key("plain") == "plain"
+
+
+# v3 #9 (Low) — a tagged key can never whole-word-match a history line, so casks/snaps
+# silently got no "why" attribution at all.
+def test_cask_attribution_uses_bare_key(monkeypatch):
+    monkeypatch.setattr(since, "_HISTORY", ["brew install --cask rectangle"])
+    f = {"category": "brew", "action": "added", "key": "rectangle (cask)",
+         "value": "0.7", "level": since.GREEN, "label": "brew package"}
+    since._enrich(f, {})
+    assert f["why"] == "brew install --cask rectangle"
+
+
+# v3 #7 (Low) — labels.json that is valid JSON of the WRONG type crashed `since mark`
+# (TypeError) and prune_snapshots (AttributeError). Same shape-validation as safe_load.
+@pytest.mark.parametrize("junk", ['["a","b"]', '"str"', '42', 'null',
+                                  '{"ok": "f.json", "bad": 5, "7": {"x": 1}}'])
+def test_corrupt_labels_file_does_not_crash(monkeypatch, tmp_path, junk):
+    monkeypatch.setattr(since, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(since, "LABELS_FILE", tmp_path / "labels.json")
+    (tmp_path / "labels.json").write_text(junk)
+    labels = since.load_labels()
+    assert isinstance(labels, dict)
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items())
+    since.save_snapshot(snap(), label="x")          # TypeError before the fix
+    since.prune_snapshots()                          # AttributeError before the fix
+    assert since.load_labels()["x"].endswith(".json")
+
+
+# v3 #8 (Low) — os.geteuid() is Unix-only; called at import it crashed win32 before the
+# honest "UNSUPPORTED PLATFORM" notice could print. (The win32 path itself is untestable here.)
+def test_euid_is_indirected():
+    assert since.EUID == os.geteuid()
+    assert since.IS_ROOT == (os.geteuid() == 0)
+    assert "uname" not in since.take_snapshot.__code__.co_names   # no Unix-only host call
+
+
+# v3 #9 (Low) — the state dir was excluded by SUBSTRING, which also excluded a sibling
+# directory whose name merely starts with it (e.g. `…/since_backup`).
+def test_big_file_scan_excludes_state_dir_not_siblings(monkeypatch, tmp_path):
+    state = tmp_path / "since"
+    state.mkdir()
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "STATE_DIR", state)
+    sib = tmp_path / "since_backup"
+    sib.mkdir()
+    (sib / "big.bin").write_bytes(b"\0" * (26 * 1024 * 1024))
+    (state / "inside.bin").write_bytes(b"\0" * (26 * 1024 * 1024))
+    files, _growing, _note = since.find_big_new_files(int(time.time()) - 600, min_mb=25)
+    paths = [p for _, p in files]
+    assert any("since_backup/big.bin" in p for p in paths), paths
+    assert not any("inside.bin" in p for p in paths), paths
+
+
+# v3 #1 (extension found while attacking the fix — NOT in the audit) — is_regular() bounds
+# a path's TYPE but not its SIZE, and is racy on its own. A 2GB *sparse* plist costs an
+# attacker nothing to plant and measured 4.1GB peak RSS through _mac_launch_items(); a
+# symlink swapped to a FIFO right after the check re-opened the hang. safe_read_* closes
+# both: O_NONBLOCK + S_ISREG on the FD, and a hard byte cap.
+def test_safe_read_caps_huge_file(tmp_path):
+    big = tmp_path / "big.bin"
+    with open(big, "wb") as f:
+        f.truncate(200 * 1024 * 1024)          # sparse: instant, ~0 disk
+    data = since.safe_read_bytes(big, limit=64 * 1024)
+    assert data is not None and len(data) == 64 * 1024
+
+
+def test_safe_read_never_blocks_on_fifo_or_device(tmp_path):
+    fifo = tmp_path / "f"
+    os.mkfifo(fifo)
+    dev = tmp_path / "z"
+    os.symlink("/dev/zero", dev)
+    with deadline():
+        assert since.safe_read_bytes(fifo) is None
+        assert since.safe_read_bytes(dev) is None
+        assert since.safe_read_text(fifo) is None
+
+
+def test_safe_read_is_toctou_safe(tmp_path):
+    """The check happens on the FD we actually read, so winning the check-then-open race
+    with a FIFO does not resurrect the hang."""
+    real = tmp_path / "real"
+    real.write_text("<plist/>")
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    link = tmp_path / "x.plist"
+    os.symlink(real, link)
+    assert since.is_regular(link)              # passes the cheap pre-check…
+    os.remove(link)
+    os.symlink(fifo, link)                     # …then the target is swapped under us
+    with deadline():
+        assert since.safe_read_bytes(link) is None
+
+
+def test_safe_read_missing_and_dir(tmp_path):
+    assert since.safe_read_bytes(tmp_path / "nope") is None
+    assert since.safe_read_bytes(tmp_path) is None            # a directory is not readable
+    ok = tmp_path / "ok"
+    ok.write_text("hello")
+    assert since.safe_read_text(ok) == "hello"
+
+
+def test_safe_read_tail_starts_on_a_line_boundary(tmp_path):
+    h = tmp_path / "hist"
+    h.write_text("".join(f"cmd number {i}\n" for i in range(1000)))
+    out = since.safe_read_text(h, limit=100, tail=True)
+    assert out.startswith("cmd number ")        # no half-line fragment
+    assert out.endswith("cmd number 999\n")     # and it really is the TAIL
+    assert len(out) < 100
+
+
+def test_history_is_bounded_and_recent(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    monkeypatch.setattr(since, "_HISTORY", None)
+    monkeypatch.setattr(since, "MAX_READ", 4096)
+    (tmp_path / ".zsh_history").write_text("".join(f"brew install pkg{i}\n" for i in range(5000)))
+    hist = since.load_history()
+    assert hist and hist[-1] == "brew install pkg4999"        # newest kept
+    assert "brew install pkg0" not in hist                    # oldest dropped by the cap

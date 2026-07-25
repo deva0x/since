@@ -212,7 +212,7 @@ silent changes visible.
 
 ```sh
 python3 -m pip install pytest
-python3 -m pytest          # 90 unit tests: diff/severity/time logic, injection-safety,
+python3 -m pytest          # 129 unit tests: diff/severity/time logic, injection-safety,
                            # privilege guard, corruption tolerance, secret redaction
 ```
 

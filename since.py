@@ -47,8 +47,10 @@ import glob
 import hashlib
 import json
 import os
+import platform as platform_module   # hostname without Unix-only os.uname()
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,7 +58,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 SCHEMA_VERSION = 3
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -75,7 +77,10 @@ PLATFORM = "macos" if sys.platform == "darwin" else "linux" if sys.platform.star
 RED, ORANGE, YELLOW, GREEN = 3, 2, 1, 0
 LEVEL_NAME = {RED: "critical", ORANGE: "notable", YELLOW: "minor", GREEN: "info"}
 
-IS_ROOT = (os.geteuid() == 0)
+# getattr, not os.geteuid() directly: geteuid/uname are Unix-only, so on win32 the module
+# crashed at IMPORT — the honest "UNSUPPORTED PLATFORM" notice never got the chance to print.
+EUID = os.geteuid() if hasattr(os, "geteuid") else -1
+IS_ROOT = (EUID == 0)
 
 # Collectors whose visibility depends on privilege. Without root, `lsof` on macOS
 # only shows the current user's own sockets — root-owned/system listeners are hidden.
@@ -145,6 +150,84 @@ def tilde(p: str) -> str:
     return p
 
 
+MAX_READ = 8 * 1024 * 1024   # plists/.desktop/manifests/rc files are KBs; 8MB is generous
+
+def safe_read_bytes(path, limit: int | None = None, tail: bool = False):
+    """Read at most `limit` bytes from a REGULAR file, else None. The ONLY way a collector
+    may touch a path it found by globbing a user-writable directory, because a plain
+    `read_bytes()` there is TWO denial-of-service vectors, both free to plant for any
+    process running as the user, and both fatal to an unattended `digest --notify` (it dies
+    before printing, saving a snapshot or notifying — a silently blinded watchdog):
+      * a FIFO — or a symlink to /dev/zero — blocks the read FOREVER. O_NONBLOCK plus an
+        S_ISREG check on the FD (not on the path, so a check-then-swap race cannot beat it)
+        makes that impossible.
+      * a multi-GB SPARSE file costs the attacker nothing to create and cost us its full
+        length in RAM: a planted 2GB plist measured 4.1GB peak RSS. The read is capped.
+    `tail=True` reads the LAST `limit` bytes — for shell history, where recency is the point.
+    `limit` defaults to MAX_READ at CALL time (not definition time), so the cap stays tunable."""
+    limit = MAX_READ if limit is None else limit
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        cut = tail and st.st_size > limit
+        if cut:
+            os.lseek(fd, -limit, os.SEEK_END)
+        chunks, got = [], 0
+        while got < limit:
+            chunk = os.read(fd, min(1 << 16, limit - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        data = b"".join(chunks)
+        # a tailed read lands mid-line; drop that fragment so callers never parse half a
+        # command as a whole one (it would show up as a bogus `why:` attribution).
+        return data.partition(b"\n")[2] if cut else data
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def safe_read_text(path, limit: int | None = None, tail: bool = False):
+    """safe_read_bytes, decoded as UTF-8 with replacement (never raises). None if unreadable."""
+    data = safe_read_bytes(path, limit, tail)
+    return None if data is None else data.decode("utf-8", "replace")
+
+
+def is_regular(p) -> bool:
+    """True only for a REGULAR file (symlinks followed) — a cheap pre-filter for candidate
+    paths. For READING, use safe_read_* instead: this check is racy on its own and says
+    nothing about size."""
+    try:
+        return Path(p).is_file()
+    except OSError:
+        return False
+
+
+# Suffixes WE append to a collector key so same-named items from different sources stay
+# distinct (`Foo (cask)` vs the formula, `Foo (~/Applications)` vs /Applications,
+# `x.desktop (system)` vs the ~/.config copy). They are part of the key's IDENTITY — but a
+# filesystem path (the trust check) or a whole-word history match (attribution) needs the
+# PLAIN name: with the suffix, `_enrich` built `…/Foo (~/Applications).app`, a path that
+# never exists, so trust_of() returned (None, False) and an unsigned app there never
+# escalated to RED. bare_key strips exactly these tags, never a name's own parentheses.
+USER_APPS_TAG = " (~/Applications)"
+SYS_AUTOSTART_TAG = " (system)"
+KEY_TAGS = (USER_APPS_TAG, SYS_AUTOSTART_TAG, " (cask)", " (snap)", " (flatpak)")
+
+def bare_key(key: str) -> str:
+    for t in KEY_TAGS:
+        if key.endswith(t):
+            return key[:-len(t)]
+    return key
+
+
 # The tool's INPUT is potentially malware-controlled (plist filenames, process
 # names, file contents…). Two dangers when we echo those back:
 #  1. terminal-escape injection — a crafted name/diff line can hide the very
@@ -183,10 +266,18 @@ _PEM_RE = re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----")
 # word. Both word-char runs are BOUNDED ({0,64}) — an unbounded `[\w.\-]*` on each side
 # is catastrophically quadratic, and a long base64-ish line in a tracked rc file could
 # stall the unattended `digest --notify` for minutes (attacker-plantable DoS).
-_KV_RE = re.compile(
-    r"(?i)([\w.\-]{0,64}(?:secret|pass(?:wd|word|phrase)?|token|api[_-]?key|access[_-]?key|"
-    r"client[_-]?secret|private[_-]?key|authoriz|_auth|credential)[\w.\-]{0,64})"
-    r"(\s*[:=]\s*|\s+)(\S.*)$")
+# The keyword alternation is a SHARED constant, interpolated into both the matcher and the
+# cheap pre-filter below, so the two can NEVER drift apart — a keyword present in one but
+# not the other would silently stop redacting that key (a leak by omission).
+_SECRET_KW = (r"secret|pass(?:wd|word|phrase)?|token|api[_-]?key|access[_-]?key|"
+              r"client[_-]?secret|private[_-]?key|authoriz|_auth|credential")
+_KV_RE = re.compile(r"(?i)([\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
+                    r"(\s*[:=]\s*|\s+)(\S.*)$")
+# Linear, backtrack-free pre-filter. _KV_RE can only match if one of these keywords is
+# present, but its bounded `[\w.\-]{0,64}` runs are retried at EVERY offset (~3µs/char) —
+# on a long keyword-free word-char line that dominated redact(). Sound by construction:
+# any _KV_RE match implies a _KV_KW_RE match on the same line.
+_KV_KW_RE = re.compile("(?i)" + _SECRET_KW)
 _SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})")  # auth headers
 _URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
 # curl .curlrc credentials: `user = "name:password"`, `-u name:password`,
@@ -205,9 +296,18 @@ _KW_VALUES = {"yes", "no", "true", "false", "none", "null", "required",
 # Keys whose VALUE is the credential itself (an assignment `password=…`, `_authToken:…`).
 # Distinct from a directive NAME that merely contains "authoriz"/"_auth"
 # (`AuthorizedKeysFile`, `AuthorizedKeysCommandUser`) — those we must SHOW.
+# `authorization` (whole word) is HARD — an `Authorization: <token>` header IS the
+# credential. It does NOT collide with the SOFT `Authorized*` sshd directives: they
+# diverge at index 8 (`authoriza…` vs `authorize…`), so `AuthorizedKeysFile` stays visible.
 _HARD_SECRET_RE = re.compile(
     r"(?i)(secret|pass(?:wd|word|phrase)?|sshpass|token|api[_-]?key|access[_-]?key|"
-    r"client[_-]?secret|private[_-]?key|credential|_auth)")   # `_auth` = npm .npmrc basic-auth field
+    r"client[_-]?secret|private[_-]?key|credential|_auth|authorization)")   # `_auth` = npm .npmrc basic-auth field
+# sudoers TAGS are grants, not secrets: `PASSWD:`/`NOPASSWD:` prefix a COMMAND list
+# (`PASSWD: /tmp/miner`, `PASSWD: ALL`) — redacting it hides the very attack we exist to
+# show. Deliberately shape-narrow (uppercase tag + colon + command-shaped value) so an
+# assignment (`PASSWD=hunter2`) or a YAML-ish `PASSWD: hunter2` still redacts.
+_SUDO_TAGS = ("PASSWD", "NOPASSWD")
+_REDACT_MAX = 4096
 
 def _char_classes(tok: str) -> int:
     return sum(bool(re.search(p, tok)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
@@ -219,6 +319,15 @@ def _is_directive_value(tok: str) -> bool:
     return (tok[:1] in "/~$") or tok.startswith("./") or (tok.lower() in _KW_VALUES)
 
 def redact(line: str) -> str:
+    # Bound the work ABSOLUTELY by capping the input. Every regex below is linear now
+    # (v2 #1 fixed the quadratic one) but carries a real ~5µs/char constant, and `--json`
+    # redacts EVERY diff line — a tracked rc file with a few hundred KB of long lines
+    # (planted, or a generated .zshrc) would stall the unattended digest for tens of
+    # seconds. Truncating also fails SAFE: the dropped tail is never printed at all, so
+    # an un-scanned secret can't ride along behind the cap.
+    if len(line) > _REDACT_MAX:
+        return (redact(line[:_REDACT_MAX])
+                + f" …(+{len(line) - _REDACT_MAX} chars, truncated)")
     # PEM body / raw key material on EITHER side of a unified diff. The char class is
     # +-agnostic, so strip the one-char diff marker before testing — otherwise a key
     # body printed raw on a `-` (removed) line while the `+` line is redacted.
@@ -237,9 +346,12 @@ def redact(line: str) -> str:
 
     def _kv(m):
         key, sep, val = m.group(1), m.group(2), m.group(3)
+        tok = val.split()[0] if val.split() else ""
         if "nopasswd" in key.lower():      # sudoers 'NOPASSWD: ALL' is NOT a secret
             return m.group(0)
-        tok = val.split()[0] if val.split() else ""
+        # sudoers `PASSWD: <command list>` — same carve-out, value-shape gated (_SUDO_TAGS)
+        if key in _SUDO_TAGS and ":" in sep and (tok.upper() == "ALL" or tok[:1] in "/!"):
+            return m.group(0)
         if _HARD_SECRET_RE.search(key):
             # The key literally NAMES a credential, so the value IS the secret.
             # An assignment (`password=…`, `_auth:…`, `SSHPASS=…`) redacts UNCONDITIONALLY:
@@ -259,7 +371,7 @@ def redact(line: str) -> str:
         # shapes were already masked by the regexes above. SHOW it, so a malicious
         # AuthorizedKeys* change stays visible (the whole point of #2).
         return m.group(0)
-    return _KV_RE.sub(_kv, line)
+    return _KV_RE.sub(_kv, line) if _KV_KW_RE.search(line) else line
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +431,10 @@ def load_history() -> list[str]:
         try:
             if not p.is_file():
                 continue
-            lines = p.read_text("utf-8", "replace").splitlines()[-6000:]
+            text = safe_read_text(p, tail=True)   # bounded: a huge history must not OOM us
+            if text is None:
+                continue
+            lines = text.splitlines()[-6000:]
             for ln in lines:
                 # zsh extended history: ": 1690000000:0;the command"
                 m = re.match(r"^: \d+:\d+;(.*)$", ln)
@@ -365,10 +480,18 @@ def _mac_launch_items():
             for p in sorted(d.glob("*.plist")):
                 # Fingerprint by CONTENT hash, not mtime: catches a swapped plist that
                 # preserved mtime (cp -p) and ignores a bare `touch` (mtime-only change).
+                # A non-regular entry is REPORTED, not skipped: reading it would hang
+                # (see is_regular), but a FIFO/device in LaunchAgents is itself anomalous
+                # and must stay visible in the highest-signal persistence category.
+                if not is_regular(p):
+                    out[tilde(str(p))] = "not a regular file (not read)"
+                    continue
+                data = safe_read_bytes(p)
                 try:
-                    fp = f"{p.stat().st_size}:{sha(p.read_bytes().decode('latin-1'))}"
+                    fp = (f"{p.stat().st_size}:{sha(data.decode('latin-1'))}" if data is not None
+                          else f"{p.stat().st_size}:?")
                 except Exception:
-                    fp = f"{p.stat().st_size}:?"
+                    fp = "?:?"
                 out[tilde(str(p))] = fp
         except Exception:
             pass
@@ -400,10 +523,11 @@ def _mac_browser_extensions():
             if ext_id == "Temp":
                 continue
             name = ext_id
-            mans = sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+                    if is_regular(m)]   # a FIFO manifest would hang the read forever
             if mans:
                 try:
-                    man = json.loads(Path(mans[-1]).read_text("utf-8", "replace"))
+                    man = json.loads(safe_read_text(mans[-1]) or "")
                     n = man.get("name", "")
                     if n and not n.startswith("__MSG_"):
                         name = n
@@ -515,7 +639,7 @@ def _mac_applications():
                 if entry.endswith(".app"):
                     # disambiguate ~/Applications from /Applications so a same-named
                     # app in both doesn't silently overwrite the other
-                    name = entry[:-4] if base == "/Applications" else f"{entry[:-4]} (~/Applications)"
+                    name = entry[:-4] if base == "/Applications" else f"{entry[:-4]}{USER_APPS_TAG}"
                     res[name] = base
         except Exception:
             pass
@@ -545,15 +669,28 @@ def _none():
     return {}
 
 
+SYS_AUTOSTART_DIR = Path("/etc/xdg/autostart")   # module-level so tests can point it at a tmp dir
+
 def _linux_autostart():
     """XDG autostart .desktop entries — the Linux 'login items' equivalent."""
     res = {}
-    for base in (HOME / ".config/autostart", Path("/etc/xdg/autostart")):
+    for base in (HOME / ".config/autostart", SYS_AUTOSTART_DIR):
+        # The two dirs hold same-named files (`x.desktop` exists in both), so a bare
+        # basename key let the SYSTEM entry silently overwrite the USER one — hiding a
+        # planted ~/.config/autostart entry behind a benign system copy. Tag the system
+        # side; the user side keeps the plain basename (and `undo_hint` keys off the tag
+        # to point `rm` at the right directory, with sudo).
+        tag = SYS_AUTOSTART_TAG if base == SYS_AUTOSTART_DIR else ""
         for f in sorted(glob.glob(str(base / "*.desktop"))):
+            key = os.path.basename(f) + tag
             name = os.path.basename(f)
             content = ""
+            if not is_regular(f):
+                # reported, not skipped — reading a FIFO here hangs the daily job
+                res[key] = f"{name} [not a regular file (not read)]"
+                continue
             try:
-                content = Path(f).read_text("utf-8", "replace")
+                content = safe_read_text(f) or ""
                 for line in content.splitlines():
                     if line.startswith("Name="):
                         name = line.split("=", 1)[1].strip() or name
@@ -564,7 +701,7 @@ def _linux_autostart():
             # plist sibling): swapping Exec=/usr/bin/true → Exec=/tmp/miner in an
             # existing entry keeps Name= identical and would otherwise be invisible in
             # the highest-signal persistence category.
-            res[os.path.basename(f)] = f"{name} [{sha(content)}]" if content else name
+            res[key] = f"{name} [{sha(content)}]" if content else name
     return res
 
 
@@ -606,7 +743,7 @@ def _linux_services():
     for f in sorted(glob.glob("/etc/init.d/*")):
         if os.path.isfile(f):
             try:
-                res[f] = f"init.d [{sha(Path(f).read_text('utf-8', 'replace'))}]"
+                res[f] = f"init.d [{sha(safe_read_text(f) or '')}]"
             except Exception:
                 res[f] = "init.d"
     return res
@@ -628,11 +765,14 @@ def _linux_browser_extensions():
                  HOME / ".config/BraveSoftware/Brave-Browser", HOME / ".config/microsoft-edge"):
         for ext_dir in glob.glob(str(base / "*/Extensions/*")):
             ext_id = os.path.basename(ext_dir)
+            if ext_id == "Temp":       # parity with the macOS collector (staging dir)
+                continue
             name = ext_id
-            mans = sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+                    if is_regular(m)]   # a FIFO manifest would hang the read forever
             if mans:
                 try:
-                    n = json.loads(Path(mans[-1]).read_text("utf-8", "replace")).get("name", "")
+                    n = json.loads(safe_read_text(mans[-1]) or "").get("name", "")
                     if n and not n.startswith("__MSG_"):
                         name = n
                 except Exception:
@@ -670,7 +810,7 @@ def _linux_outbound():
 def _linux_net_config():
     res = {}
     try:
-        for line in Path("/etc/resolv.conf").read_text("utf-8", "replace").splitlines():
+        for line in (safe_read_text("/etc/resolv.conf") or "").splitlines():
             m = re.match(r"\s*nameserver\s+(\S+)", line)
             if m:
                 res[f"DNS {m.group(1)}"] = "nameserver"
@@ -682,7 +822,7 @@ def _linux_net_config():
     # notify every day. /etc/environment and profile.d are stable regardless of caller.
     for src in (Path("/etc/environment"), *[Path(p) for p in sorted(glob.glob("/etc/profile.d/*.sh"))]):
         try:
-            for line in src.read_text("utf-8", "replace").splitlines():
+            for line in (safe_read_text(src) or "").splitlines():
                 m = re.match(r"\s*(?:export\s+)?(https?_proxy|all_proxy)\s*=\s*(\S+)", line, re.I)
                 if m:
                     res[f"{m.group(1).lower()} ({src.name})"] = redact(m.group(2).strip('"\''))
@@ -778,13 +918,14 @@ def text_sources() -> dict[str, str]:
                        Path("/etc/ld.so.preload")]  # ld.so.preload = a classic rootkit hook
     for p in rc:
         try:
-            if p.is_file():
-                add(tilde(str(p)), p.read_text("utf-8", "replace"))
+            text = safe_read_text(p)
+            if text is not None:
+                add(tilde(str(p)), text)
         except Exception:
             pass
 
     try:
-        add("/etc/hosts", Path("/etc/hosts").read_text("utf-8", "replace"))
+        add("/etc/hosts", safe_read_text("/etc/hosts") or "")
     except Exception:
         pass
 
@@ -799,8 +940,9 @@ def text_sources() -> dict[str, str]:
                  + sorted(glob.glob("/etc/sudoers.d/*")))
     for f in cron_sudo:
         try:
-            if Path(f).is_file():
-                add(f, Path(f).read_text("utf-8", "replace"))
+            text = safe_read_text(f)
+            if text is not None:
+                add(f, text)
         except Exception:
             pass
     return out
@@ -831,10 +973,10 @@ def take_snapshot(all_cats=True) -> dict:
         "platform": PLATFORM,
         "created": datetime.now().isoformat(timespec="seconds"),
         "epoch": int(time.time()),
-        "euid": os.geteuid(),
+        "euid": EUID,
         "root": IS_ROOT,
         "host": (run(["scutil", "--get", "ComputerName"]).strip()
-                 if PLATFORM == "macos" else os.uname().nodename),
+                 if PLATFORM == "macos" else platform_module.node()),
         "collectors": {},
         "blobs": {},
         "errors": {},
@@ -903,10 +1045,17 @@ def save_snapshot(snap: dict, label: str | None = None) -> Path:
 
 
 def load_labels() -> dict:
+    """{label -> snapshot filename}. Shape-validated for the same reason as safe_load():
+    a valid-JSON-but-wrong-type labels.json (`["a","b"]` — an editor mishap, a bad restore)
+    otherwise crashed `since mark` with a raw TypeError inside save_snapshot, and
+    prune_snapshots with an AttributeError. Non-str entries are dropped, not fatal."""
     try:
-        return json.loads(LABELS_FILE.read_text())
+        d = json.loads(LABELS_FILE.read_text())
     except Exception:
         return {}
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 def prune_snapshots():
@@ -1050,8 +1199,11 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
     except Exception:
         pass
     files = []
+    state = str(STATE_DIR)
     for path in out.split("\0"):
-        if not path or str(STATE_DIR) in path:
+        # path-PREFIX match, not substring: a plain `in` also excluded a sibling
+        # directory whose name merely starts with the state dir's (e.g. `since_backup`).
+        if not path or path == state or path.startswith(state + os.sep):
             continue
         try:
             files.append((os.path.getsize(path), tilde(path)))
@@ -1132,7 +1284,12 @@ def undo_hint(category: str, key: str, value) -> str | None:
 
     if PLATFORM == "linux":
         if category == "login_items":  # XDG autostart .desktop file
-            return f"rm {q(str(HOME / '.config/autostart') + '/' + key)}   # (system copy in /etc/xdg/autostart needs sudo)"
+            # the key tells us WHICH dir it came from — a blanket ~/.config path was
+            # simply wrong (and a silent no-op) for a /etc/xdg/autostart entry.
+            if key.endswith(SYS_AUTOSTART_TAG):
+                base = key[:-len(SYS_AUTOSTART_TAG)]
+                return f"sudo rm {q('/etc/xdg/autostart/' + base)}"
+            return f"rm {q(str(HOME / '.config/autostart') + '/' + key)}"
         if category == "launch_items":
             if real.startswith("/etc/init.d/"):
                 return f"sudo update-rc.d {q(os.path.basename(real))} disable"
@@ -1262,7 +1419,8 @@ def _enrich(f: dict, current: dict):
         if cat == "launch_items":
             prog = program_of_plist(key)
         elif cat == "applications":
-            prog = f"{f['value']}/{key}.app"
+            # bare_key: the ' (~/Applications)' disambiguator is not part of the path
+            prog = f"{f['value']}/{bare_key(key)}.app"
         if prog:
             label, suspicious = trust_of(prog)
             f["trust"] = label
@@ -1270,7 +1428,9 @@ def _enrich(f: dict, current: dict):
                 f["level"] = RED
     # attribution for software installs
     if cat in ("brew", "npm_global", "pip", "applications", "mac_app_store") and action == "added":
-        f["why"] = attribution_for(key)
+        # bare_key: a tagged key (`foo (cask)`, `foo (snap)`) can never whole-word-match
+        # a history line, so casks/snaps/flatpaks silently got no "why" at all.
+        f["why"] = attribution_for(bare_key(key))
     # undo hints for anything reversible we added
     if action == "added":
         f["undo"] = undo_hint(cat, key, f["value"])
@@ -1513,7 +1673,7 @@ def cmd_ignore(args):
     print(f"Ignoring: {args.pattern}")
 
 def cmd_caps(args):
-    who = run(["whoami"]).strip() or str(os.geteuid())
+    who = run(["whoami"]).strip() or str(EUID)
     print(paint("since — coverage & privileges", "bold"))
     print(f"Running as: {who} " + (paint("(root — full coverage)", "green") if IS_ROOT
                                     else paint("(not root)", "yellow")))

@@ -2,6 +2,76 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.3] — 2026-07-25
+
+Fixes for a **third** independent (Kimi) adversarial audit, which re-verified every v0.4.2
+fix as genuine and then found one new High in the collector layer. Every fix below was
+reproduced by execution first and is covered by a regression test (suite 90 → **129**).
+
+**Security / availability (High):**
+- **A planted FIFO or device symlink no longer hangs the daily digest.** Four collectors
+  (`~/Library/LaunchAgents` plists, XDG `.desktop` entries, and both browser-extension
+  manifest readers) read glob-matched paths with no regular-file check, so a FIFO — or a
+  symlink to `/dev/zero` — dropped into any of those *user-writable* directories blocked
+  `read()` **forever**, inside `take_snapshot()`, before any output, snapshot or
+  notification: `digest --notify` produced nothing and leaked one hung process per day.
+  A watchdog that dies silently is the exact failure this tool exists to prevent.
+  Regression-tested with real FIFOs under a SIGALRM deadline (the harness is self-checked:
+  it does catch an unguarded read). A non-regular entry in a persistence directory is now
+  *reported* ("not a regular file"), not silently skipped — such an entry is itself anomalous.
+- **Every collector read is now bounded and race-proof (`safe_read_bytes`/`safe_read_text`).**
+  Auditing the fix above showed a type check alone was not enough: a **2GB sparse file**
+  planted as a plist costs an attacker nothing to create and drove **4.1GB peak RSS**
+  (2GB → 62MB after the fix), and a symlink swapped to a FIFO *after* the check re-opened the
+  hang. Reads now open with `O_NONBLOCK`, verify `S_ISREG` on the **file descriptor** (not the
+  path, so the check-then-open race cannot be won), and stop at 8MB. Shell history is read
+  from the *tail* (recency is what attribution needs) starting at a line boundary. Applied to
+  every plist/`.desktop`/manifest/rc-file/`/etc` read — snapshot output on a real machine is
+  byte-identical before and after.
+
+**Secret hygiene / performance (Medium):**
+- **`Authorization: <token>` is now masked.** The v0.4.2 HARD/SOFT key split had swept the
+  `authoriz` keyword into "always show" to keep `AuthorizedKeysFile` visible, which left a
+  raw `Authorization:` header (`.curlrc`/`.wgetrc`) printing in cleartext unless it happened
+  to use the `Basic`/`Bearer`/JWT shapes. Whole-word `authorization` is HARD; the
+  `Authorized*` sshd directives (absolute *and* relative paths) stay visible.
+- **`redact()` cost is now bounded absolutely.** It was linear after v0.4.2 but carried a
+  ~3–5µs/char constant, and `--json` redacts *every* diff line, so a few hundred KB of long
+  lines in a tracked rc file stalled the digest for tens of seconds. A shared-keyword linear
+  pre-filter short-circuits keyword-free lines (40KB: 128ms → 0.4ms) and every line is
+  capped at 4KB before the regexes run — truncation also fails safe, since the dropped tail
+  is never printed. The pre-filter and the matcher are generated from one keyword constant
+  so they cannot drift apart.
+
+**Correctness (Low):**
+- A sudoers **`PASSWD:` tag** no longer hides the command list it prefixes (`PASSWD:
+  /tmp/miner` was rendered `PASSWD: «redacted»` — the v0.4.2 carve-out covered only
+  `NOPASSWD:`). Value-shape gated, so a real `PASSWD=<secret>` assignment still redacts.
+- **XDG autostart entries no longer collide across directories.** Keys were bare basenames,
+  so `/etc/xdg/autostart/x.desktop` silently overwrote — hid — a planted
+  `~/.config/autostart/x.desktop`. System entries are now tagged ` (system)` and their undo
+  hint points at the right directory with `sudo` (it previously pointed `rm` at `~/.config`,
+  where the file isn't). *One-time effect on Linux: existing `/etc/xdg` entries appear once
+  as removed+added as the keys change.*
+- **Apps in `~/Applications` are trust-checked again.** The v0.4.2 same-name disambiguator
+  made `_enrich` build `…/Foo (~/Applications).app`, a path that never exists, so
+  `trust_of()` returned nothing and an unsigned/ad-hoc app there could never escalate to
+  RED. The new `bare_key()` also restores "why" attribution for tagged keys — a
+  `foo (cask)`/`foo (snap)` key could never whole-word-match a shell-history line.
+- A **corrupt `labels.json`** that is valid JSON of the wrong type (`["a","b"]`) no longer
+  crashes `since mark` (`TypeError`) or `prune_snapshots` (`AttributeError`) — `load_labels()`
+  now shape-validates like `safe_load()`.
+- `os.geteuid()`/`os.uname()` are no longer called at import, so on Windows the honest
+  "UNSUPPORTED PLATFORM" notice can actually print instead of a traceback.
+- The big-file scan excluded the state directory by *substring*, which also excluded any
+  sibling directory whose name merely starts with it (`…/since_backup`) — now a path-prefix
+  match. The Linux browser-extension collector skips the `Temp` staging dir (macOS parity).
+
+**Docs:** `SECURITY.md` gains an explicit **threat model** — a process running as you can
+tamper with the baselines in `~/.local/state/since` and erase its own tracks, and helper
+binaries are `PATH`-resolved (the daily job's minimal `PATH` is unaffected). Stale
+`CLAUDE.md` state lines corrected.
+
 ## [0.4.2] — 2026-07-25
 
 Fixes for a second independent (Kimi) adversarial audit — the v0.3.1 fix round and the
