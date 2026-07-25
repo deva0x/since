@@ -151,10 +151,25 @@ def test_new_port_on_known_listener_surfaces():
 
 
 def test_full_port_turnover_is_suppressed():
-    b = snap(collectors={"listening": {"rapportd": "5000,6000"}})
-    c = snap(collectors={"listening": {"rapportd": "5001,6002"}})
-    findings = since.build_findings(b, c)
-    assert not [f for f in findings if f["category"] == "listening"]
+    """Churn suppression is now NARROW: a multi-port set that is entirely EPHEMERAL (>=32768).
+    The old rule — "no overlap => churn" — silently dropped `8080 -> 4444` and a backdoor sharing
+    a churny process name, in the highest-signal category. This test used 5000/6000, which is
+    indistinguishable from that attack, so it encoded the bug."""
+    b = snap(collectors={"listening": {"rapportd": "49152,49153"}})
+    c = snap(collectors={"listening": {"rapportd": "49160,49161"}})
+    assert not [f for f in since.build_findings(b, c) if f["category"] == "listening"]
+
+
+@pytest.mark.parametrize("before,after", [
+    ({"svc": "8080"}, {"svc": "4444"}),                        # single-port rebind
+    ({"rapportd": "49152"}, {"rapportd": "49157,4444"}),       # backdoor under a churny name
+    ({"svc": "5000,6000"}, {"svc": "5001,6002"}),              # non-ephemeral turnover
+])
+def test_non_ephemeral_port_turnover_is_reported(before, after):
+    f = [x for x in since.build_findings(snap(collectors={"listening": before}),
+                                         snap(collectors={"listening": after}))
+         if x["category"] == "listening"]
+    assert f and f[0]["level"] >= since.ORANGE, (before, after, f)
 
 
 # --------------------------------------------------------------------------- H3: privilege-sensitive blobs
@@ -408,6 +423,7 @@ def test_linux_service_execstart_swap_detected(monkeypatch):
         return ""
     fake_run.exec = "{ path=/usr/bin/true ; argv[]=/usr/bin/true }"
     monkeypatch.setattr(since, "run", fake_run)
+    monkeypatch.setattr(since, "run_checked", fake_run)   # list-unit-files is checked now
     before = since._linux_services()["evil.service"]
     fake_run.exec = "{ path=/tmp/miner ; argv[]=/tmp/miner }"   # same unit, enabled, swapped Exec
     after = since._linux_services()["evil.service"]
@@ -1789,3 +1805,184 @@ def test_installer_parses_and_has_no_bare_return_after_a_test():
     # the exact shape that caused it: `[ ... ] || return` with no explicit status
     assert "|| return\n" not in installer.read_text(), \
         "`|| return` propagates status 1 under set -e — use an explicit `return 0`"
+
+
+# =========================================================================== #
+# Round 4 — the previously UN-REVIEWED surfaces (collectors, render, ignore).   #
+# Five rounds had hammered redact() and the guard; this was the first look at   #
+# the rest, and it was the most productive round of the project.                #
+# =========================================================================== #
+
+# #1 (HIGH) — a broken helper turned its category into a silent EMPTY set: the diff reads that as
+# "everything removed", tomorrow as "all of them are new" with the attacker's port among them, and
+# if it stays broken the report says "Nothing changed" while a backdoor listens. SECURITY.md
+# promises a skip WITH A NOTE; only a raised error delivers that.
+@pytest.mark.parametrize("collector,tool", [
+    ("_listening", "lsof"), ("_outbound", "lsof"), ("_mac_login_items", "osascript"),
+    ("_mac_net_config", "scutil"), ("_mac_kexts", "kextstat"),
+    ("_mac_system_extensions", "systemextensionsctl"),
+])
+@pytest.mark.parametrize("mode", ["timeout", "nonzero"])
+def test_collector_tool_failure_is_loud(monkeypatch, collector, tool, mode):
+    monkeypatch.setattr(since.shutil, "which", lambda t: f"/usr/bin/{t}")
+    def fake(cmd, **kw):
+        if cmd and cmd[0] == tool:
+            if mode == "timeout":
+                raise since.subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+            class P:
+                returncode, stdout, stderr = 1, "", "boom"
+            return P()
+        class Q:
+            returncode, stdout, stderr = 0, "", ""
+        return Q()
+    monkeypatch.setattr(since.subprocess, "run", fake)
+    with pytest.raises(since.ToolUnavailable):
+        getattr(since, collector)()
+
+
+def test_lost_coverage_covers_untooled_categories():
+    """coverage_lost required a TOOL STAMP, which only 4 of 13 categories have — so a broken
+    lsof/osascript/scutil produced a passive note in the loudest categories in the tool."""
+    def mk(err=None, listening=None):
+        s = snap(collectors={"listening": listening or {}})
+        s["errors"] = err or {}
+        s["tools"] = {c: "" for c in since.CAT_TOOLS}
+        return s
+    good = mk(listening={"sshd": "22", "nginx": "80"})
+    broken = mk(err={"listening": "lsof timed out after 20s"})
+    unusable = since.unusable_cats(good, broken)
+    lost = since.coverage_lost(good, broken, unusable)
+    assert "listening" in lost, "a broken lsof was only a note"
+    findings = since.build_findings(good, broken, skip_cats=tuple(unusable), coverage=lost)
+    assert not [f for f in findings if f["category"] == "listening"]      # no phantom removals
+    assert since.max_level(findings) >= since.ORANGE                      # and it notifies
+
+
+# #2 (HIGH) — `cp /bin/sh ~/Library/.../SoftwareUpdateHelper` keeps the Apple signature, and the
+# interpreter check was basename-only, so the report printed "signature: Apple-signed" beside
+# attacker-planted persistence.
+def test_apple_signed_binary_outside_system_paths_is_suspicious(tmp_path):
+    import subprocess as sp
+    copy = tmp_path / "SoftwareUpdateHelper"
+    sp.run(["cp", "/bin/sh", str(copy)], check=True)
+    label, suspicious = since.trust_of(str(copy))
+    assert suspicious, label
+    assert "COPIED" in label or "copied" in label, label
+    assert since.trust_of("/bin/sh") == ("Apple-signed", False)           # the real one is fine
+
+
+# #9 (MEDIUM) — reconstructing the bundle path from the KEY read the WRONG app: a bundle named
+# `Calculator (cask).app` printed Calculator's signature; `Evil (snap).app` pointed nowhere so an
+# unsigned bundle never escalated. /Applications is admin-writable.
+def test_app_trust_check_uses_the_stored_path(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(since, "trust_of", lambda p: (seen.append(p) or ("unsigned", True)))
+    for key in ("Calculator (cask)", "Evil (snap)", "Plain"):
+        bundle = tmp_path / f"{key}.app"
+        f = {"category": "applications", "action": "added", "key": key, "value": str(bundle),
+             "level": since.GREEN, "label": "app", "trust": None, "why": None, "undo": None}
+        since._enrich(f, {})
+        assert seen[-1] == str(bundle), f"checked the wrong bundle: {seen[-1]}"
+        assert f["level"] == since.RED
+
+
+def test_applications_collector_stores_the_real_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    apps = tmp_path / "Applications"
+    (apps / "Evil (snap).app").mkdir(parents=True)
+    monkeypatch.setattr(since.os, "listdir",
+                        lambda b: ["Evil (snap).app"] if str(b) == str(apps) else [])
+    res = since._mac_applications()
+    assert any(v.endswith("Evil (snap).app") for v in res.values()), res
+
+
+# #4 (HIGH) — extension fingerprints were the DISPLAY NAME, so overwriting background.js, adding
+# <all_urls>/cookies/webRequest, or swapping the .xpi were all invisible in a user-writable dir.
+def test_extension_manifest_change_is_detected(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    d = tmp_path / "Library/Application Support/Google/Chrome/Default/Extensions/abcd/1.9.0_0"
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({"name": "uBlock", "permissions": ["storage"]}))
+    before = since._mac_browser_extensions()
+    (d / "manifest.json").write_text(json.dumps(
+        {"name": "uBlock", "permissions": ["storage", "<all_urls>", "cookies", "webRequest"]}))
+    assert since._mac_browser_extensions() != before, "a permission escalation was invisible"
+
+
+def test_extension_version_dirs_sort_numerically(monkeypatch, tmp_path):
+    """Lexical order put `1.10.0_0` before `1.9.0_0`, so the OLD manifest was read."""
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    base = tmp_path / "Library/Application Support/Google/Chrome/Default/Extensions/abcd"
+    for v, name in (("1.9.0_0", "old"), ("1.10.0_0", "new")):
+        (base / v).mkdir(parents=True)
+        (base / v / "manifest.json").write_text(json.dumps({"name": name}))
+    assert "new" in list(since._mac_browser_extensions().values())[0]
+
+
+def test_firefox_extension_swap_is_detected(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "HOME", tmp_path)
+    d = tmp_path / ".mozilla/firefox/p1/extensions"
+    d.mkdir(parents=True)
+    xpi = d / "evil@x.xpi"
+    xpi.write_bytes(b"a" * 100)
+    before = since._linux_browser_extensions()
+    xpi.write_bytes(b"b" * 500)             # swapped in place
+    os.utime(xpi, (1784000000, 1784000000))
+    assert since._linux_browser_extensions() != before
+
+
+# #6 (MEDIUM-HIGH) — `startswith("com.apple")` is a string test, not provenance: naming a rootkit
+# `com.apple.driver.AudioHelper` removed it from the report, and `co.`/`dev.`/`me.` prefixes were
+# never collected at all.
+def test_kext_collector_records_impersonating_and_unusual_ids(monkeypatch):
+    out = ("Index Refs Address Size Wired Name (Version) <Linked Against>\n"
+           "  9 0 0xff 0x1 0x1 com.apple.driver.AudioHelper (1.0) <9>\n"
+           " 10 0 0xff 0x1 0x1 co.evilcorp.rootkit (1.0) <10>\n"
+           " 11 0 0xff 0x1 0x1 dev.evil.hook (2.0) <11>\n")
+    monkeypatch.setattr(since.shutil, "which", lambda t: "/usr/sbin/kextstat")
+    class P:
+        returncode, stdout, stderr = 0, out, ""
+    monkeypatch.setattr(since.subprocess, "run", lambda cmd, **kw: P())
+    res = since._mac_kexts()
+    for k in ("com.apple.driver.AudioHelper", "co.evilcorp.rootkit", "dev.evil.hook"):
+        assert k in res, (k, res)
+
+
+# #8 (MEDIUM) — creating a tracked config file was QUIETER than editing one: `~/.zshenv` is
+# sourced by every zsh invocation, and at YELLOW it never crossed the --notify threshold.
+def test_new_tracked_config_file_is_orange_and_notifies():
+    b = snap()
+    c = snap(blobs={"~/.zshenv": "export PATH=$HOME/.evil/bin:$PATH\n"})
+    f = [x for x in since.build_findings(b, c) if x["category"] == "config"][0]
+    assert f["action"] == "added" and f["level"] >= since.ORANGE
+    assert "NEW FILE" in since._describe(f)
+
+
+# #7 (MEDIUM) — socket/path activation is standard user-level systemd persistence and was absent
+# from every snapshot.
+def test_linux_services_collects_socket_and_path_units(monkeypatch):
+    seen = {}
+    def fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return ""
+    monkeypatch.setattr(since, "run_checked", fake)
+    monkeypatch.setattr(since, "run", fake)
+    monkeypatch.setattr(since, "need", lambda *a: None)
+    since._linux_services()
+    joined = " ".join(seen["cmd"])
+    for unit_type in ("service", "timer", "socket", "path"):
+        assert unit_type in joined, joined
+
+
+# #13 (LOW) — a corrupt labels.json made load_labels() return {}, which prune_snapshots read as
+# "nothing is protected" and then DELETED the user's checkpoints.
+def test_corrupt_labels_does_not_unprotect_checkpoints(monkeypatch, tmp_path):
+    monkeypatch.setattr(since, "SNAP_DIR", tmp_path)
+    monkeypatch.setattr(since, "LABELS_FILE", tmp_path / "labels.json")
+    monkeypatch.setattr(since, "KEEP_SNAPSHOTS", 1)
+    for i in range(4):
+        (tmp_path / f"2026072{i}T090000-178400000{i}.json").write_text(json.dumps(snap()))
+    (tmp_path / "labels.json").write_text("{corrupt")
+    before = len(since.list_snapshot_paths())
+    since.prune_snapshots()
+    assert len(since.list_snapshot_paths()) == before, "pruned while labels were unreadable"

