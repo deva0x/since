@@ -1068,3 +1068,17 @@ def test_tool_absent_in_both_snapshots_is_silent():
     b = _cap_snap({}, errors={"brew": "not on PATH: brew"}, tools={"brew": ""})
     assert since.unusable_cats(a, b) == {}          # nothing to compare either way
     assert since.coverage_lost(a, b, {}) == {}
+
+
+def test_tool_swap_is_also_lost_coverage():
+    """A planted shim (`~/.local/bin/brew`) changes the tool IDENTITY without erroring. The
+    daily job's pinned PATH necessarily includes user-writable dirs, so this is the cheapest
+    suppression route: it must rank and notify, not whisper a note."""
+    good = _cap_snap({f"pkg{i}": "1" for i in range(50)}, tools={"brew": "/opt/homebrew/bin/brew"})
+    shim = _cap_snap({f"pkg{i}": "1" for i in range(50)}, tools={"brew": "/home/u/.local/bin/brew"})
+    unusable = since.unusable_cats(good, shim)
+    lost = since.coverage_lost(good, shim, unusable)
+    assert "brew" in lost, "a swapped tool bought the attacker silence"
+    findings = since.build_findings(good, shim, skip_cats=tuple(unusable), coverage=lost)
+    assert since.max_level(findings) >= since.ORANGE
+    assert not [f for f in findings if f["category"] == "brew"]      # still no phantom flood

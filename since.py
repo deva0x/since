@@ -1511,12 +1511,22 @@ def coverage_lost(baseline: dict, current: dict, unusable: dict) -> dict:
     attacker who breaks `brew` would otherwise buy silence for their own install. A first run,
     or a baseline predating tool stamping, is NOT a loss — that's benign and gets a note only."""
     bt = baseline.get("tools") or {}
+    ct = current.get("tools")
     be = baseline.get("errors", {}) or {}
     ce = current.get("errors", {}) or {}
     lost = {}
     for cat, why in unusable.items():
         had_it = bool(bt.get(cat)) and cat not in be      # baseline could genuinely see it
-        if had_it and (cat in ce or not (current.get("tools") or {}).get(cat)):
+        if not had_it or ct is None:
+            continue          # first run, absent in both, or the pre-stamp transition: benign
+        gone = cat in ce or not ct.get(cat)
+        # A tool that merely CHANGED is equally a loss of comparability, and equally abusable:
+        # the daily job's pinned PATH necessarily includes user-writable dirs, so planting
+        # ~/.local/bin/brew swaps the identity WITHOUT erroring — and a passive note bought the
+        # attacker silence for their own package. Rare enough in normal use (a Homebrew
+        # reinstall, a python upgrade) to be worth one look when it happens.
+        swapped = bool(ct.get(cat)) and ct.get(cat) != bt.get(cat)
+        if gone or swapped:
             lost[cat] = why
     return lost
 

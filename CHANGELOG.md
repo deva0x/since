@@ -6,7 +6,7 @@ All notable changes to `since`. Format loosely follows Keep a Changelog.
 
 A security release fixing **16 issues found by reviewing v0.4.3 itself** — each reproduced by
 execution before being fixed, and each pinned by a regression test that was *mutation-tested*
-(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **176**. Most of these sat
+(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **177**. Most of these sat
 behind an architectural blind spot rather than inside any one function:
 
 - Every previous audit round hardened the **snapshot** boundary; **diff-time enrichment had no
@@ -44,9 +44,12 @@ behind an architectural blind spot rather than inside any one function:
   an attacker buy *silence* by breaking a collector's tool, since neither the old phantom flood nor
   a note ever reached the `--notify` threshold. A category that was visible in the baseline and
   isn't now yields an ORANGE **"LOST VISIBILITY"** finding that ranks under "worth a look" and
-  fires the notification. A first run, a legitimately absent tool, or the one-time pre-v0.4.4
-  stamp transition stays a quiet note — verified in all three directions. (Found by reviewing the
-  capability guard added earlier in this same release.)
+  fires the notification — and that covers a tool that merely **changed** as well as one that
+  vanished, because the pinned job `PATH` necessarily includes user-writable directories, so
+  planting `~/.local/bin/brew` swaps the tool identity *without* erroring and was the cheapest
+  suppression route of all. A first run, a legitimately absent tool, and the one-time pre-v0.4.4
+  stamp transition stay quiet notes — all verified. (Both found by reviewing the capability guard
+  added earlier in this same release.)
 - **`difflib` was quadratic on a planted rc file** (~100 distinct repeated lines defeat its
   autojunk filter): a 0.74 MB `~/.zshrc` cost 32s of a real digest run. `MAX_READ` bounded the
   read; nothing bounded the diff. Above 20k lines / 1 MB the change is reported *with a content
