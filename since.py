@@ -1072,6 +1072,20 @@ def backend_for(cat_key: str):
 
 
 # text files whose *contents* we track, so we can show the exact line that changed
+def malicious_hits(text: str) -> set:
+    """Descriptions of every malicious pattern present in `text`, scanned LINE BY LINE with a
+    per-line cap. These patterns are line-oriented, and one `search()` over a whole blob (up to
+    MAX_READ) was quadratic in the number of trigger tokens on a single line. Bounding the line
+    length here AND the patterns' own runs above keeps the scan linear."""
+    hits = set()
+    for line in text.splitlines():
+        line = line[:_REDACT_MAX]
+        for pat, desc in MALICIOUS_PATTERNS:
+            if desc not in hits and pat.search(line):
+                hits.add(desc)
+    return hits
+
+
 def text_sources(flags: dict | None = None) -> dict[str, str]:
     out: dict[str, str] = {}
 
@@ -1083,7 +1097,7 @@ def text_sources(flags: dict | None = None) -> dict[str, str]:
             # still detected (the sha covers everything) but it silently fell RED -> ORANGE and
             # lost its "why". Flags are diffed separately, so escalation survives truncation.
             if flags is not None:
-                hits = sorted({desc for pat, desc in MALICIOUS_PATTERNS if pat.search(content)})
+                hits = sorted(malicious_hits(content))
                 if hits:
                     flags[label] = hits
             if len(content) > BLOB_MAX:
@@ -1142,8 +1156,11 @@ MALICIOUS_PATTERNS = [
     (re.compile(r"curl[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
     (re.compile(r"wget[^\n|]*\|\s*(ba)?sh", re.I), "pipes a download straight into a shell"),
     (re.compile(r"(ba)?sh\s+<\(\s*(curl|wget)", re.I), "runs a download via process substitution"),
-    (re.compile(r"\bbase64\b\s+-{1,2}d\w*.*\|\s*(ba)?sh", re.I), "decodes base64 and runs it"),
-    (re.compile(r"\bnc\b.*-e\b", re.I), "netcat reverse shell"),
+    # bounded runs, not `.*`: unbounded, these were quadratic in the number of trigger tokens
+    # on one line — a planted line of repeated `base64 -d ` cost 55s at 375KB and hours at
+    # MAX_READ, at SNAPSHOT time. A real decode-and-run chain is adjacent, not megabytes apart.
+    (re.compile(r"\bbase64\b\s+-{1,2}d\w*[^\n]{0,400}?\|\s*(ba)?sh", re.I), "decodes base64 and runs it"),
+    (re.compile(r"\bnc\b[^\n]{0,400}?-e\b", re.I), "netcat reverse shell"),
     (re.compile(r"^\s*0\.0\.0\.0\s+\S*[a-z]", re.I | re.M), "redirects a real domain (hosts)"),
     # 127.0.0.1 mapping a real domain (not localhost/broadcasthost) — phishing redirect
     (re.compile(r"^\s*127\.0\.0\.1\s+(?!localhost|broadcasthost)\S*\.[a-z]{2,}", re.I | re.M),

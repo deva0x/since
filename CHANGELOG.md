@@ -6,7 +6,7 @@ All notable changes to `since`. Format loosely follows Keep a Changelog.
 
 A security release fixing **16 issues found by reviewing v0.4.3 itself** — each reproduced by
 execution before being fixed, and each pinned by a regression test that was *mutation-tested*
-(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **221**. Most of these sat
+(revert the fix, confirm the test fails: **24/24 caught**). Suite 129 → **227**. Most of these sat
 behind an architectural blind spot rather than inside any one function:
 
 - Every previous audit round hardened the **snapshot** boundary; **diff-time enrichment had no
@@ -103,6 +103,12 @@ mutation-tested regression test (40/40 mutations caught cumulatively):
 - **The storage cap silently disabled RED escalation.** A payload appended past `BLOB_MAX` (or past
   the diff cap) never reached the diff text, so a `curl | sh` line fell to ORANGE with no `why`.
   Malicious patterns are now scanned over the *full* content at snapshot time and diffed as flags.
+- **The new full-content scan re-opened a quadratic DoS** (found by measuring my own round-2 fix
+  rather than trusting it): two malicious-pattern regexes used unbounded `.*`, which is quadratic
+  in the number of trigger tokens on one line — a planted line of repeated `base64 -d ` cost 55s at
+  375 KB and hours at `MAX_READ`, at **snapshot** time, before anything is saved. The runs are now
+  bounded and the scan is line-wise with a per-line cap: flat ~3 ms regardless of token count,
+  detection unchanged. This was latent in the pre-v0.4.4 diff-text path too.
 - **`plutil` was handed unbounded input** at diff time (a 500 MB plist measured 2.27 GB RSS); the
   plist is size-gated now, like every collector read.
 - **A malicious LaunchAgent was labelled "signature: Apple-signed".** `ProgramArguments =

