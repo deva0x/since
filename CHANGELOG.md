@@ -2,6 +2,26 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.7] — 2026-07-25
+
+Found by **dogfooding**, one hour into a three-day trial run on a real Mac — not by any of the six
+adversarial review rounds.
+
+**A listener rotating ephemeral ports no longer fires a notification every few hours.** Apple's
+`rapportd` keeps one port and rotates the others (measured: `57905,65426,65427` →
+`57905,65428,65429`). v0.4.6 judged churn by whether the port sets OVERLAP, so a rotation that
+retained one port was treated as a real signal — ORANGE, which crosses the `--notify` threshold.
+On a normal Mac that is a desktop notification every few hours, forever, which is precisely how a
+digest teaches its reader to ignore it.
+
+Churn is now a balanced **rotation** entirely inside the ephemeral range (≥32768), judged on what
+*changed* rather than on set overlap. A net **gain** is never suppressed — whatever the port
+number, including ephemeral ones, because malware binds those too. The four real rotations
+measured on the trial machine are now regression fixtures, alongside the five gain/rebind cases
+from v0.4.6 that must still report.
+
+Suite 658 → **667**.
+
 ## [0.4.6] — 2026-07-25
 
 A **fourth** adversarial round, pointed for the first time at the surfaces the previous five had

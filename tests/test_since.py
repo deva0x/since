@@ -2059,3 +2059,35 @@ def test_json_output_is_always_json(tmp_path, extra):
     assert payload["baseline"] is None and payload["findings"] == []
     assert payload["notes"] and "no baseline" in payload["notes"][0]
     assert (payload["first_snapshot"] is None) == bool(extra)
+
+
+# From the live trial, hour one: Apple's `rapportd` keeps one port and rotates two others every
+# few hours (57905,65426,65427 -> 57905,65428,65429). Because the sets OVERLAP, the round-4 rule
+# called it a real signal and fired ORANGE — and therefore a desktop notification — every few
+# hours. Churn is a balanced ROTATION inside the ephemeral range, judged on what CHANGED.
+@pytest.mark.parametrize("before,after", [
+    ("57905,65426,65427", "57905,65428,65429"),      # measured on the real machine
+    ("57905,65428,65429", "59858,65469,65470"),      # measured (full turnover)
+    ("59858,65469,65470", "59858,65471,65472"),      # measured (the line the user was shown)
+    ("49152,49153", "49160,49161"),
+])
+def test_ephemeral_port_rotation_is_churn(before, after):
+    b = snap(collectors={"listening": {"rapportd": before}})
+    c = snap(collectors={"listening": {"rapportd": after}})
+    assert not [f for f in since.build_findings(b, c) if f["category"] == "listening"], \
+        "ephemeral rotation must not notify — this is what teaches a user to ignore the digest"
+
+
+@pytest.mark.parametrize("before,after,why", [
+    ({"svc": "8080"}, {"svc": "4444"}, "single-port rebind to a well-known port"),
+    ({"rapportd": "49152"}, {"rapportd": "49157,4444"}, "backdoor under a churny process name"),
+    ({"svc": "5000,6000"}, {"svc": "5001,6002"}, "non-ephemeral turnover"),
+    ({"sshd": "22"}, {"sshd": "22,4444"}, "net gain, well-known port"),
+    ({"sshd": "22"}, {"sshd": "22,49999"}, "net gain, EPHEMERAL port — malware binds these too"),
+])
+def test_net_port_gain_is_always_reported(before, after, why):
+    """A gain without a matching loss is never suppressed, whatever the port number."""
+    f = [x for x in since.build_findings(snap(collectors={"listening": before}),
+                                        snap(collectors={"listening": after}))
+         if x["category"] == "listening"]
+    assert f and f[0]["level"] >= since.ORANGE, why

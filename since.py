@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -1987,14 +1987,18 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                     removed_ports = sorted(old_ports - new_ports)
                     if not (added_ports or removed_ports):
                         continue                       # nothing actually changed
-                    # Churn suppression must be NARROW. "no overlap => churn" dropped a
-                    # single-port service rebinding (8080 -> 4444) and a backdoor sharing a
-                    # churny process name (rapportd 49152 -> 49157,4444) — both silently, in the
-                    # highest-signal category. Only a multi-port set that is ENTIRELY ephemeral
-                    # is churn; anything with a well-known port is reported.
-                    ephemeral = all(pt.isdigit() and int(pt) >= 32768
-                                    for pt in (old_ports | new_ports) if pt)
-                    if not (old_ports & new_ports) and ephemeral and len(old_ports) > 1:
+                    # Churn is a balanced ROTATION entirely inside the ephemeral range — judged on
+                    # what CHANGED, not on whether the sets overlap. Measured on a real machine:
+                    # Apple's `rapportd` keeps one port and rotates two others every few hours
+                    # (57905,65426,65427 -> 57905,65428,65429). An overlap test called that a real
+                    # signal, so it fired ORANGE — and therefore a desktop notification — every
+                    # few hours forever, which is how a digest teaches its reader to ignore it.
+                    #
+                    # A net GAIN is never suppressed, whatever the port number: malware binding a
+                    # random high port adds without removing, so it still reports.
+                    def _eph(ports):
+                        return all(pt.isdigit() and int(pt) >= 32768 for pt in ports if pt)
+                    if added_ports and removed_ports and _eph(added_ports) and _eph(removed_ports):
                         continue
                     level = ORANGE if added_ports else YELLOW
                     if added_ports:
