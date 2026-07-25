@@ -75,10 +75,16 @@ if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
   # replacement form silently produces nothing and this would quietly rebuild the very
   # blindness it exists to prevent.
   JOB_PATH=""
+  # NOTE every path returns 0. `[ -d "$1" ] || return` propagated status 1 for a PATH entry
+  # that does not exist (e.g. /snap/bin on a box without snapd), and under `set -e` that
+  # aborted the whole installer right after the first snapshot — silently skipping the daily
+  # job with no error shown. Only reproducible on a machine with a missing PATH entry.
   _add_dir() {
-    case ":${JOB_PATH}:" in *":$1:"*) return;; esac
-    [ -d "$1" ] || return
-    case "$1" in /*) JOB_PATH="${JOB_PATH:+${JOB_PATH}:}$1";; esac
+    case ":${JOB_PATH}:" in *":$1:"*) return 0;; esac
+    if [ -d "$1" ]; then
+      case "$1" in /*) JOB_PATH="${JOB_PATH:+${JOB_PATH}:}$1";; esac
+    fi
+    return 0
   }
   _old_ifs="$IFS"; IFS=":"
   for d in $PATH; do _add_dir "$d"; done
