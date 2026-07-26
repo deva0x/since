@@ -2091,3 +2091,66 @@ def test_net_port_gain_is_always_reported(before, after, why):
                                         snap(collectors={"listening": after}))
          if x["category"] == "listening"]
     assert f and f[0]["level"] >= since.ORANGE, why
+
+
+# =========================================================================== #
+# Day 1 of the live trial. None of these came from adversarial review — they    #
+# came from watching real output on a real developer's machine.                 #
+# =========================================================================== #
+
+# The bind address was in the lsof/ss output we already parse, and we threw it away — so
+# `claude` on 127.0.0.1:64991 was reported at the same severity as `*:4444`. On a dev machine
+# java/node/claude/python bind loopback constantly, and that was the main listener noise.
+@pytest.mark.parametrize("binding,expect_local", [
+    ("127.0.0.1:64991", True), ("127.0.0.53:53", True), ("[::1]:8080", True),
+    ("localhost:3000", True),
+    ("*:4444", False), ("192.168.1.5:4444", False), ("0.0.0.0:22", False),
+    ("4444", False),                       # bare port from a pre-v0.4.8 snapshot: unknown => loud
+])
+def test_binding_locality(binding, expect_local):
+    assert since.binding_is_local(binding) is expect_local
+    assert since.binding_port(binding) in ("64991", "53", "8080", "3000", "4444", "22")
+
+
+@pytest.mark.parametrize("bindings,level,why", [
+    ("127.0.0.1:64991", "YELLOW", "the trial's actual noise: not reachable off-machine"),
+    ("127.0.0.1:60325,127.0.0.1:60329", "YELLOW", "multi-port loopback (java on the trial box)"),
+    ("*:4444", "ORANGE", "reachable from anywhere"),
+    ("192.168.1.5:4444", "ORANGE", "reachable on the LAN"),
+    ("127.0.0.1:8080,*:9090", "ORANGE", "ANY non-local binding keeps it loud"),
+    ("4444", "ORANGE", "unknown locality must stay loud, not be assumed safe"),
+])
+def test_new_listener_severity_follows_reachability(bindings, level, why):
+    f = [x for x in since.build_findings(snap(), snap(collectors={"listening": {"p": bindings}}))
+         if x["category"] == "listening"]
+    assert f, why
+    assert f[0]["level"] == (since.YELLOW if level == "YELLOW" else since.ORANGE), why
+    # YELLOW must stay below the --notify threshold; ORANGE must reach it
+    assert (f[0]["level"] >= since.ORANGE) == (level == "ORANGE")
+
+
+def test_rotation_suppression_still_works_on_addr_port_bindings():
+    b = snap(collectors={"listening": {"x": "127.0.0.1:65426,127.0.0.1:65427"}})
+    c = snap(collectors={"listening": {"x": "127.0.0.1:65428,127.0.0.1:65429"}})
+    assert not [f for f in since.build_findings(b, c) if f["category"] == "listening"]
+    # …but gaining a publicly-bound port is still reported
+    d = snap(collectors={"listening": {"x": "127.0.0.1:65426,*:4444"}})
+    f = [x for x in since.build_findings(b, d) if x["category"] == "listening"]
+    assert f and f[0]["level"] >= since.ORANGE
+
+
+# A Rust workspace produced +772MB across 15 dep-graph.bin/.rlib entries in one day on the trial
+# machine, crowding the "biggest new files" list with pure build churn.
+@pytest.mark.parametrize("d", ["target", "build", "dist", "Pods", "__pycache__", "node_modules"])
+def test_build_dirs_are_pruned_from_the_big_file_scan(d):
+    assert d in since.BIGFILE_PRUNE
+
+
+# `claude-code 2.1.206 -> 2.1.212` arrived with why=None while `brew upgrade` sat in the history.
+def test_changed_software_gets_attribution(monkeypatch):
+    monkeypatch.setattr(since, "_HISTORY", ["cd ~/dev", "brew upgrade claude-code", "ls"])
+    f = {"category": "brew", "action": "changed", "key": "claude-code",
+         "value": ("2.1.206", "2.1.212"), "level": since.GREEN, "label": "brew package",
+         "trust": None, "why": None, "undo": None}
+    since._enrich(f, {})
+    assert f["why"] == "brew upgrade claude-code"

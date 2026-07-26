@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -816,8 +816,10 @@ def _listening():
         elif tag == "n" and cur is not None:
             m = _PORT_F_RE.search(val)
             if m:
-                by_cmd[cur].add(m.group(1))
-    return {c: ",".join(sorted(p, key=lambda x: (len(x), x))) for c, p in by_cmd.items() if p}
+                # `val` is e.g. `127.0.0.1:64991`, `*:8080`, `[::1]:5000` — keep it whole.
+                by_cmd[cur].add(val.strip())
+    return {c: ",".join(sorted(p, key=lambda x: (len(binding_port(x)), x)))
+            for c, p in by_cmd.items() if p}
 
 
 def _outbound():
@@ -1097,6 +1099,26 @@ def _linux_browser_extensions():
 
 
 _SS_PROC_RE = re.compile(r'users:\(\("([^"]+)"')
+# A listener is stored as `addr:port`, because WHERE it is bound decides whether it is
+# reachable at all. Measured on a real dev machine during the trial run: `java`, `node`,
+# `claude` and friends bind 127.0.0.1 constantly, and reporting those at the same severity as
+# `*:4444` is the main source of listener noise — while the bind address was sitting unused in
+# the `lsof`/`ss` output we already parse. Bare ports (pre-v0.4.8 snapshots) are tolerated and
+# treated as NOT known-local, i.e. they keep the louder severity.
+_LOOPBACK_PREFIXES = ("127.", "::1", "[::1]", "localhost")
+
+
+def binding_port(b: str) -> str:
+    """The port from an `addr:port` binding, or the bare value if there is no address."""
+    return b.rsplit(":", 1)[-1].strip("[]") if ":" in b else b
+
+
+def binding_is_local(b: str) -> bool:
+    """True only when we KNOW the binding is loopback — unknown stays loud."""
+    if ":" not in b:
+        return False                       # a bare port from an older snapshot: unknown
+    addr = b.rsplit(":", 1)[0]
+    return addr.startswith(_LOOPBACK_PREFIXES)
 
 def _linux_listening():
     """ss -ltnp: listening TCP keyed by process (falls back to lsof if ss absent)."""
@@ -1108,10 +1130,10 @@ def _linux_listening():
         parts = line.split()
         if len(parts) < 4:
             continue
-        port = parts[3].rsplit(":", 1)[-1]
         m = _SS_PROC_RE.search(line)
-        by_cmd.setdefault(m.group(1) if m else "?", set()).add(port)
-    return {c: ",".join(sorted(p, key=lambda x: (len(x), x))) for c, p in by_cmd.items() if p}
+        by_cmd.setdefault(m.group(1) if m else "?", set()).add(parts[3].strip())
+    return {c: ",".join(sorted(p, key=lambda x: (len(binding_port(x)), x)))
+            for c, p in by_cmd.items() if p}
 
 
 def _linux_outbound():
@@ -1582,7 +1604,13 @@ def resolve_baseline(arg: str | None) -> tuple[Path | None, str]:
 # big new files + fastest-growing dirs (computed live vs baseline time)
 # ---------------------------------------------------------------------------
 
-BIGFILE_PRUNE = {"Library", "node_modules", "DerivedData",
+# Build outputs are pruned for the same reason node_modules is: on a developer machine they
+# dominate the "biggest new files" list with pure churn. Measured on the trial machine — one Rust
+# workspace produced +772MB across 15 `dep-graph.bin`/`.rlib` entries in a day, crowding out
+# anything a person would actually want to see. This section is informational (GREEN tier) and
+# the report already states that it only covers visible locations.
+BIGFILE_PRUNE = {"target", "build", "dist", "Pods", "__pycache__", ".venv", "venv",
+                 "Library", "node_modules", "DerivedData",
                  "Photos Library.photoslibrary", "Music Library.musiclibrary"}
 
 def find_big_new_files(since_epoch: int, min_mb: int = 25, top: int = 15):
@@ -1974,6 +2002,14 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                 # quiet-tier categories (outbound) are informational only — never
                 # let them reach the ranked "worth a look" section or fire a notify.
                 level = GREEN if meta["tier"] == "quiet" else base_level(meta["cls"], action)
+                if key == "listening" and action == "added" and isinstance(v, str):
+                    # Loopback-only: visible in the report, but it does NOT cross the --notify
+                    # threshold. A process reachable only from this machine is a different claim
+                    # from one listening on every interface, and conflating them is what made a
+                    # developer's java/node/claude churn indistinguishable from `*:4444`.
+                    binds = [b for b in v.split(",") if b]
+                    if binds and all(binding_is_local(b) for b in binds):
+                        level = YELLOW
                 extra = {}
                 if key == "listening" and action == "changed":
                     # A daemon that rebinds ALL its ports each boot (rapportd) shares
@@ -1996,8 +2032,9 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                     #
                     # A net GAIN is never suppressed, whatever the port number: malware binding a
                     # random high port adds without removing, so it still reports.
-                    def _eph(ports):
-                        return all(pt.isdigit() and int(pt) >= 32768 for pt in ports if pt)
+                    def _eph(bindings):
+                        return all(binding_port(b).isdigit() and int(binding_port(b)) >= 32768
+                                   for b in bindings if b)
                     if added_ports and removed_ports and _eph(added_ports) and _eph(removed_ports):
                         continue
                     level = ORANGE if added_ports else YELLOW
@@ -2139,7 +2176,11 @@ def _enrich(f: dict, current: dict):
             if suspicious:
                 f["level"] = RED
     # attribution for software installs
-    if cat in ("brew", "npm_global", "pip", "applications", "mac_app_store") and action == "added":
+    # "changed" too, not just "added": a version bump is a software change a user asks "why?"
+    # about, and the answer is usually one line up in their shell history. Measured on the trial:
+    # `claude-code 2.1.206 -> 2.1.212` arrived with why=None while `brew upgrade` sat in history.
+    if (cat in ("brew", "npm_global", "pip", "applications", "mac_app_store")
+            and action in ("added", "changed")):
         # bare_key: a tagged key (`foo (cask)`, `foo (snap)`) can never whole-word-match
         # a history line, so casks/snaps/flatpaks silently got no "why" at all.
         f["why"] = attribution_for(bare_key(key))

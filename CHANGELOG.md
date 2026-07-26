@@ -2,6 +2,32 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.8] — 2026-07-26
+
+Day 1 of a three-day trial on a real developer's Mac. Every fix below came from watching actual
+output, not from review — and the biggest one is a capability the tool always had the data for
+and threw away. Suite 667 → **689**.
+
+**Listeners now record WHERE they are bound, and severity follows reachability.** `lsof` and `ss`
+report `127.0.0.1:64991`; the collector kept only `64991`. So `claude` on loopback was reported at
+the same severity as `*:4444` — and on a developer machine `java`, `node`, `claude` and `python`
+bind loopback constantly, which was the dominant source of listener noise. A new listener bound
+only to loopback is now YELLOW: visible in the report, below the `--notify` threshold. **Any**
+non-local binding (`*`, `0.0.0.0`, a LAN address) stays ORANGE, a mixed set stays ORANGE, and a
+bare port from an older snapshot is treated as *unknown* and stays ORANGE — unknown is never
+assumed safe.
+
+**Build outputs are pruned from the big-file scan.** One Rust workspace produced +772 MB across 15
+`dep-graph.bin`/`.rlib` entries in a single day, crowding out anything a person would want to see.
+`target`, `build`, `dist`, `Pods`, `__pycache__`, `.venv`, `venv` join `node_modules` and friends.
+
+**Changed software gets its "why" too.** `claude-code 2.1.206 → 2.1.212` was reported with no
+attribution while `brew upgrade claude-code` sat one line up in the shell history — attribution ran
+only for `added`, not `changed`.
+
+*Upgrade note: listener values change from `4444` to `addr:4444`, so listeners appear once as
+removed+added.*
+
 ## [0.4.7] — 2026-07-25
 
 Found by **dogfooding**, one hour into a three-day trial run on a real Mac — not by any of the six
