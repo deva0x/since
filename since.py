@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -2019,6 +2019,15 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                     # stopped listening (YELLOW). Previously BOTH were dropped entirely.
                     old_ports = set(str(v[0]).split(","))
                     new_ports = set(str(v[1]).split(","))
+                    # Migration-aware. v0.4.8 started storing `addr:port` where older snapshots
+                    # held a bare port, and comparing `5000` with `*:5000` as opaque strings
+                    # turned a REPRESENTATION change into a storm of "changed listener" findings
+                    # — 11 in a single cycle on the trial machine, every one a false alarm, all
+                    # at ORANGE, all notifying. When either side predates the change, compare
+                    # what both sides actually express: the port set.
+                    if any(":" not in b for b in old_ports | new_ports):
+                        old_ports = {binding_port(b) for b in old_ports}
+                        new_ports = {binding_port(b) for b in new_ports}
                     added_ports = sorted(new_ports - old_ports)
                     removed_ports = sorted(old_ports - new_ports)
                     if not (added_ports or removed_ports):

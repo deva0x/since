@@ -2154,3 +2154,37 @@ def test_changed_software_gets_attribution(monkeypatch):
          "trust": None, "why": None, "undo": None}
     since._enrich(f, {})
     assert f["why"] == "brew upgrade claude-code"
+
+
+# Day 3 of the trial: v0.4.8 changed listener storage from `5000` to `*:5000`, and the diff
+# compared those as opaque strings — so the upgrade itself produced 11 "changed listener"
+# findings in one cycle, every one a false alarm, all ORANGE, all notifying. A representation
+# change must never look like a security event.
+def test_listener_storage_migration_is_not_a_finding():
+    old = {"ControlCenter": "5000,7000", "adb": "5037", "postgres": "5432",
+           "Python": "8737,8899,8931"}                      # pre-v0.4.8 (bare ports)
+    new = {"ControlCenter": "*:5000,*:7000", "adb": "127.0.0.1:5037",
+           "postgres": "127.0.0.1:5432,[::1]:5432", "Python": "*:8737,*:8899,*:8931"}
+    f = [x for x in since.build_findings(snap(collectors={"listening": old}),
+                                        snap(collectors={"listening": new}))
+         if x["category"] == "listening"]
+    assert not f, f"the upgrade itself alarmed: {[(x['key'], x['value']) for x in f]}"
+
+
+def test_migration_does_not_mask_a_real_new_port():
+    """The compatibility path must not become a blind spot."""
+    old = {"adb": "5037"}
+    new = {"adb": "127.0.0.1:5037,*:4444"}
+    f = [x for x in since.build_findings(snap(collectors={"listening": old}),
+                                        snap(collectors={"listening": new}))
+         if x["category"] == "listening"]
+    assert len(f) == 1 and f[0]["level"] >= since.ORANGE
+    assert "4444" in str(f[0].get("added_ports"))
+
+
+def test_exposure_change_is_reported_once_both_sides_are_addressed():
+    """Both sides new-format: localhost -> all-interfaces is a genuine exposure change."""
+    f = [x for x in since.build_findings(snap(collectors={"listening": {"x": "127.0.0.1:5000"}}),
+                                        snap(collectors={"listening": {"x": "*:5000"}}))
+         if x["category"] == "listening"]
+    assert f, "a service becoming publicly reachable must be reported"

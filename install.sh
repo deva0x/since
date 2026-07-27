@@ -148,6 +148,18 @@ EOF
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now since.timer 2>/dev/null; then
       echo "  enabled systemd user timer: since.timer  (output → journalctl --user -u since.service)"
       echo "  verify with:  systemctl --user list-timers since.timer"
+      # `enable --now` succeeding proves only that a user manager exists RIGHT NOW — and it
+      # exists because you are logged in. Without lingering, systemd tears that manager down at
+      # your last logout and the timer stops with it, so a "successfully enabled" daily job can
+      # quietly go dormant on exactly the machine that needs it most: a server nobody logs into.
+      # Persistent=true makes it catch up at the next login rather than lose the run outright.
+      if command -v loginctl >/dev/null 2>&1 &&
+         [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = "no" ]; then
+        echo
+        echo "  NOTE: lingering is off for this user, so the timer only runs while you are"
+        echo "  logged in (it catches up at your next login). On a headless box, enable it:"
+        echo "     sudo loginctl enable-linger $(id -un)"
+      fi
     else
       echo "  wrote unit files to ${SYSTEMD_DIR}, but could NOT activate the timer"
       echo "  (no user systemd session — common on headless boxes). To finish:"

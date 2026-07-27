@@ -2,6 +2,35 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.9] — 2026-07-27
+
+Day 3 of the trial, and both fixes are things only a multi-day run on real machines could have
+shown. Suite 689 → **692**.
+
+**Upgrading to 0.4.8 set off a false alarm on every listener.** 0.4.8 started storing `*:5000`
+where older snapshots held `5000`, and the diff compared those as opaque strings — so the first
+run after the upgrade reported 11 "changed listener" findings on the trial Mac and 3 on the Linux
+box, all at ORANGE, all of them notifying, and every single one a lie: the ports were identical.
+The changelog had predicted this churn and waved it through as harmless, which it was not. The
+listening diff now compares what both sides actually express — when either side predates the
+change it compares port sets, so a pure representation change produces nothing. This is *not* a
+blanket exemption: a genuinely new port arriving alongside the migration is still reported, and
+once both snapshots carry addresses, `127.0.0.1:5000` → `*:5000` is a real exposure change and
+stays a finding.
+
+The general lesson, recorded in RULES.md: a change to how a collector *stores* a value must never
+be able to look like a change in what it *observed*.
+
+**The Linux installer no longer promises a daily job it cannot keep.** `systemctl --user enable
+--now` succeeding proves only that a user manager exists at that moment — and it exists because
+you are logged in. With lingering off, systemd tears that manager down at your last logout and
+the timer goes with it, so the installer printed a confident "enabled systemd user timer" for a
+job that then goes dormant on exactly the machine that needs it most: a server nobody logs into.
+(`Persistent=true` means the run is deferred to the next login rather than lost.) The installer
+now checks `loginctl show-user ... -p Linger` after a successful enable and prints the one-line
+fix when lingering is off. Verified on a real Ubuntu box in both directions: the note appears
+with `Linger=no` and is absent after `enable-linger`.
+
 ## [0.4.8] — 2026-07-26
 
 Day 1 of a three-day trial on a real developer's Mac. Every fix below came from watching actual
