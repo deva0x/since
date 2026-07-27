@@ -2,6 +2,19 @@
 
 All notable changes to `since`. Format loosely follows Keep a Changelog.
 
+## [0.4.10] — 2026-07-27
+
+Found by reading the trial machine's own digest, minutes after shipping 0.4.9. Suite 692 → **696**.
+
+**Severity now follows reachability for a gained port, not just a new listener.** 0.4.8 taught the
+tool that a loopback-only binding is a different claim from `*:4444` — but wired that rule into the
+`added` path only. So an ssh local port-forward showed up as `listener ssh now ALSO on port(s)
+127.0.0.1:8080` at ORANGE, above the notify threshold, while the identical binding on a brand new
+process was YELLOW. Same binding, same reachability, two different answers depending on whether
+the process was already in the baseline. A gained port that is loopback-only is now YELLOW; one
+public port among loopback ones keeps the whole finding ORANGE; and a bare port from a pre-0.4.8
+snapshot is still treated as unknown, therefore loud.
+
 ## [0.4.9] — 2026-07-27
 
 Day 3 of the trial, and both fixes are things only a multi-day run on real machines could have

@@ -2188,3 +2188,34 @@ def test_exposure_change_is_reported_once_both_sides_are_addressed():
                                         snap(collectors={"listening": {"x": "*:5000"}}))
          if x["category"] == "listening"]
     assert f, "a service becoming publicly reachable must be reported"
+
+
+# The trial's own digest reported `listener ssh now ALSO on 127.0.0.1:8080` at ORANGE — a local
+# port-forward, notifying. v0.4.8 taught severity to follow reachability but only on the `added`
+# path, so the same binding was YELLOW as a new listener and ORANGE as a gained port.
+def _listen_change(old, new):
+    return [x for x in since.build_findings(snap(collectors={"listening": {"ssh": old}}),
+                                           snap(collectors={"listening": {"ssh": new}}))
+            if x["category"] == "listening"]
+
+
+def test_gained_loopback_port_does_not_notify():
+    f = _listen_change("*:22", "*:22,127.0.0.1:8080")
+    assert len(f) == 1 and f[0]["level"] == since.YELLOW
+
+
+def test_gained_public_port_still_notifies():
+    f = _listen_change("*:22", "*:22,*:8080")
+    assert len(f) == 1 and f[0]["level"] >= since.ORANGE
+
+
+def test_mixed_gain_is_loud():
+    """One publicly-bound port among loopback ones must not be averaged away."""
+    f = _listen_change("*:22", "*:22,127.0.0.1:8080,*:9090")
+    assert len(f) == 1 and f[0]["level"] >= since.ORANGE
+
+
+def test_gained_port_of_unknown_locality_stays_loud():
+    """Bare port from a pre-v0.4.8 snapshot: unknown binding is never assumed safe."""
+    f = _listen_change("22", "22,8080")
+    assert len(f) == 1 and f[0]["level"] >= since.ORANGE

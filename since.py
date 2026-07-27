@@ -59,7 +59,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "0.4.9"
+__version__ = "0.4.10"
 SCHEMA_VERSION = 5   # 4: snap['tools'] (tool identity); 5: snap['blob_flags']
 
 if sys.version_info < (3, 9):  # uses PEP 585 generics in annotations + os.replace
@@ -2046,7 +2046,17 @@ def build_findings(baseline: dict, current: dict, include_quiet=False, skip_cats
                                    for b in bindings if b)
                     if added_ports and removed_ports and _eph(added_ports) and _eph(removed_ports):
                         continue
-                    level = ORANGE if added_ports else YELLOW
+                    # Locality decides severity for a GAINED port exactly as it does for a brand
+                    # new listener — v0.4.8 applied that rule only to `added`, so an ssh local
+                    # port-forward (`ssh now ALSO on 127.0.0.1:8080`) still fired ORANGE and
+                    # notified, while the identical binding on a new process was YELLOW. A port
+                    # reachable only from this machine is the same claim either way. Bare ports
+                    # from a pre-v0.4.8 snapshot are not local by `binding_is_local`, so an
+                    # unknown binding stays loud.
+                    if added_ports and not all(binding_is_local(b) for b in added_ports):
+                        level = ORANGE
+                    else:
+                        level = YELLOW
                     if added_ports:
                         extra["added_ports"] = added_ports
                     if removed_ports:
